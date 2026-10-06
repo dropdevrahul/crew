@@ -1,6 +1,6 @@
 [package]
 name = "crew"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "crew — a terminal dashboard to run, chat with, and manage coding agents across harnesses (Claude, OpenCode, Cursor). Standalone; optional nexum engine integration."
 
