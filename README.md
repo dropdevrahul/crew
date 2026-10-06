@@ -51,8 +51,32 @@ The binary lands at `target/release/crew`. Regenerate the website after UI
 changes with `python3 site/gen.py` (captures live `--snapshot` frames).
 
 **Prebuilt binaries.** Pushing a `v*` tag builds and attaches
-`crew-<tag>-<target>.tar.gz` (macOS arm64/x86_64, Linux x86_64) to a GitHub
+`crew-<tag>-<target>.zip` (macOS arm64/x64, Linux x64) to a GitHub
 Release via `.github/workflows/release.yml`.
+
+### Install from a release
+
+Download the zip for your platform, extract it, and put `crew` on your `PATH`:
+
+```sh
+# macOS (Apple Silicon)
+curl -LO https://github.com/dropdevrahul/crew/releases/download/v0.0.1/crew-v0.0.1-macos-arm64.zip
+unzip crew-v0.0.1-macos-arm64.zip
+sudo mv crew /usr/local/bin/
+
+# macOS (Intel)
+curl -LO https://github.com/dropdevrahul/crew/releases/download/v0.0.1/crew-v0.0.1-macos-x64.zip
+
+# Linux (x86_64)
+curl -LO https://github.com/dropdevrahul/crew/releases/download/v0.0.1/crew-v0.0.1-linux-x64.zip
+```
+
+**macOS Gatekeeper:** if macOS says *"Apple could not verify 'crew' is free
+of malware"*, run:
+
+```sh
+xattr -d com.apple.quarantine /usr/local/bin/crew
+```
 
 ## Run
 
