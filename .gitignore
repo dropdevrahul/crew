@@ -1,0 +1,4 @@
+target/
+.crew/
+.crew-data/
+*.DS_Store
