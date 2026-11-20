@@ -1780,13 +1780,6 @@ impl App {
         }
     }
 
-    /// Live agents that would die on quit (pty-backed, not tmux).
-    pub fn live_mortal(&mut self) -> usize {
-        self.workspaces.iter_mut()
-            .map(|w| w.agents.iter_mut().filter(|p| p.tmux.is_none()).map(|p| p.is_alive()).filter(|a| *a).count())
-            .sum()
-    }
-
     // ── the left tree: all · repo · its agents ──────────────────────────────
     /// Every line of the tree, top to bottom.
     pub fn tree(&self) -> Vec<TreeItem> {

@@ -242,7 +242,7 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
 | `shift-tab` | (in chat) forwarded to the agent — cycles Claude Code's modes (plan / auto-accept) |
 | `D` | duplicate the selected agent into a prefilled new-agent form |
 | `w` | pin another folder as a workspace (`x` in the repos pane unpins; the picker opens beside the current repo) |
-| `q` | quit — tmux agents keep running; with the pty backend it confirms first |
+| `q` | quit (always confirms) — tmux agents keep running; pty agents stop and stay resumable |
 | `d` | review the worktree diff; `/` searches, `n`/`N` cycle matches |
 | `L` | tail a headless agent's log — live-follows at the bottom; `G` re-follows, `/` search, `r` reload |
 | `P` | commit + push the worktree (or **all marked**) and open a PR (`gh`) |

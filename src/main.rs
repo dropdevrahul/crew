@@ -495,12 +495,8 @@ fn vim_delta(key: &KeyEvent, page: i64) -> Option<i64> {
 }
 
 fn request_quit(app: &mut App) {
-    // tmux-backed agents survive quitting — only confirm if some would die
-    if app.live_mortal() > 0 {
-        app.mode = Mode::ConfirmQuit;
-    } else {
-        app.should_quit = true;
-    }
+    // always confirm; the dialog says whether agents stop or keep running (tmux)
+    app.mode = Mode::ConfirmQuit;
 }
 
 /// Scroll the selected agent's chat history (>0 = older).

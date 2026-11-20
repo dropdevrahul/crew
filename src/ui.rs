@@ -1077,21 +1077,26 @@ fn draw_confirm_quit(f: &mut Frame, app: &App) {
     let n: usize = app.workspaces.iter()
         .flat_map(|w| w.agents.iter()).filter(|p| p.tmux.is_none()).count();
     let dirty = app.dirty.values().filter(|d| **d).count();
+    let head = if n > 0 { format!("  Quit? {} agent(s) will stop (pty backend).", n) }
+        else { "  Quit crew? Agents keep running in tmux.".to_string() };
     let mut lines = vec![
         Line::from(""),
-        Line::from(Span::styled(format!("  Quit? {} agent(s) will stop (pty backend).", n),
-            Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(head, Style::default().add_modifier(Modifier::BOLD))),
     ];
     if dirty > 0 {
         lines.push(Line::from(Span::styled(
             format!("  ⚠ {} worktree(s) have uncommitted changes (± in the list).", dirty),
             Style::default().fg(Color::Yellow))));
     }
+    if n > 0 {
+        lines.extend([
+            Line::from(""),
+            Line::from(Span::styled("  Worktrees are kept; next time, [enter] on a ▷", Style::default().fg(Color::Gray))),
+            Line::from(Span::styled("  agent resumes its conversation. Install tmux to", Style::default().fg(Color::Gray))),
+            Line::from(Span::styled("  keep agents running after quit ([,] settings).", Style::default().fg(Color::Gray))),
+        ]);
+    }
     lines.extend([
-        Line::from(""),
-        Line::from(Span::styled("  Worktrees are kept; next time, [enter] on a ▷", Style::default().fg(Color::Gray))),
-        Line::from(Span::styled("  agent resumes its conversation. Install tmux to", Style::default().fg(Color::Gray))),
-        Line::from(Span::styled("  keep agents running after quit ([,] settings).", Style::default().fg(Color::Gray))),
         Line::from(""),
         Line::from(Span::styled("  [y] quit   [n/esc] cancel", Style::default().fg(Color::DarkGray))),
     ]);
