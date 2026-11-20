@@ -621,6 +621,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 }
                 return;
             }
+            if code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.open_picker();
+                return;
+            }
             if !app.agent_selected() {
                 match code {
                     KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => { app.tree_enter_repo(); return; }
@@ -761,6 +765,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char(c) => app.rename_buf.push(c),
             _ => {}
         },
+        Mode::Picker => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let last = app.picker_items().len().saturating_sub(1);
+            match code {
+                KeyCode::Esc => app.mode = app.picker.ret,
+                KeyCode::Enter => app.picker_pick(),
+                KeyCode::Down => app.picker.cursor = (app.picker.cursor + 1).min(last),
+                KeyCode::Up => app.picker.cursor = app.picker.cursor.saturating_sub(1),
+                KeyCode::Char('n') if ctrl => app.picker.cursor = (app.picker.cursor + 1).min(last),
+                KeyCode::Char('p') if ctrl => app.picker.cursor = app.picker.cursor.saturating_sub(1),
+                KeyCode::Backspace => { app.picker.query.pop(); app.picker.cursor = 0; }
+                KeyCode::Char(c) if !ctrl => { app.picker.query.push(c); app.picker.cursor = 0; }
+                _ => {}
+            }
+        }
         Mode::ConfirmDiscard => match code {
             KeyCode::Char('y') => { app.new_form = app::NewAgentForm::default(); app.mode = Mode::Normal; }
             KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::NewAgent,

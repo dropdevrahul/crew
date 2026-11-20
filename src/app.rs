@@ -43,6 +43,23 @@ pub enum Mode {
     Retry,
     /// Built-in folder browser used to pin a new workspace.
     BrowseFolder,
+    /// Telescope-style fuzzy agent picker overlay.
+    Picker,
+}
+
+/// State for `Mode::Picker`: the filter query, the highlighted row and the
+/// mode to restore on cancel.
+#[derive(Debug, Clone)]
+pub struct Picker {
+    pub query: String,
+    pub cursor: usize,
+    pub ret: Mode,
+}
+
+impl Default for Picker {
+    fn default() -> Self {
+        Picker { query: String::new(), cursor: 0, ret: Mode::Normal }
+    }
 }
 
 /// One line of the left tree: "all", a repo, or one of that repo's agents
@@ -353,6 +370,7 @@ pub struct Workspace {
     pub settings_backend: String,
     /// Text buffer while labeling an agent (Mode::Rename).
     pub rename_buf: String,
+    pub picker: Picker,
     /// Cached git status of the selected worktree: (path, summary, is_clean).
     pub worktree_status: Option<(String, String, bool)>,
     /// Cached remote state of the selected branch (not pushed / ↑a ↓b / up to date).
@@ -415,6 +433,7 @@ impl Workspace {
             settings_field: 0,
             settings_backend: String::new(),
             rename_buf: String::new(),
+            picker: Picker::default(),
             worktree_status: None,
             sel_remote: None,
             pr_map: HashMap::new(),
@@ -1791,6 +1810,37 @@ impl App {
         }
     }
 
+    // ── agent picker ────────────────────────────────────────────────────────
+    pub fn open_picker(&mut self) {
+        self.picker = Picker {
+            ret: if self.mode == Mode::Terminal { Mode::Terminal } else { Mode::Normal },
+            ..Picker::default()
+        };
+        self.mode = Mode::Picker;
+    }
+    /// Agents matching every whitespace-separated query term (case-insensitive).
+    pub fn picker_items(&self) -> Vec<TreeItem> {
+        let q = self.picker.query.to_lowercase();
+        let terms: Vec<&str> = q.split_whitespace().collect();
+        self.tree()
+            .into_iter()
+            .filter(|it| {
+                let TreeItem::Agent(i, j) = *it else { return false };
+                let r = &self.workspaces[i].rows[j];
+                let hay = format!("{} {} {} {}", self.workspaces[i].name(), r.display(), r.harness, r.status_label())
+                    .to_lowercase();
+                terms.iter().all(|t| hay.contains(t))
+            })
+            .collect()
+    }
+    /// Jump to the highlighted agent: live ones open their chat directly.
+    pub fn picker_pick(&mut self) {
+        let items = self.picker_items();
+        let Some(&it) = items.get(self.picker.cursor) else { return };
+        self.set_tree(it);
+        self.mode = if self.selected_row().is_some_and(|r| r.is_live()) { Mode::Terminal } else { Mode::Normal };
+    }
+
     // ── the left tree: all · repo · its agents ──────────────────────────────
     /// Every line of the tree, top to bottom.
     pub fn tree(&self) -> Vec<TreeItem> {
@@ -2338,6 +2388,51 @@ mod tests {
     fn rec(id: &str, wt: &str) -> AgentRecord {
         AgentRecord { id: id.into(), harness: "claude".into(), model: "sonnet".into(),
             worktree: wt.into(), task: format!("task {id}"), label: None, session_id: None, created: 1.0 }
+    }
+
+    fn picker_app() -> App {
+        let d1 = std::env::temp_dir().join(format!("crew-pk1-{}", std::process::id()));
+        let d2 = std::env::temp_dir().join(format!("crew-pk2-{}", std::process::id()));
+        let mut a = App::new(Store::new(d1.clone(), d1.join("s")));
+        a.workspaces.push(Workspace::new(Store::new(d2.clone(), d2.join("s"))));
+        a.workspaces[0].registry.push(rec("a1", "/tmp"));
+        a.workspaces[1].registry.push(rec("b1", "/tmp"));
+        a.workspaces[1].registry.push(rec("b2", "/tmp"));
+        for w in &mut a.workspaces { w.refresh().unwrap(); }
+        a
+    }
+
+    #[test]
+    fn picker_filters_multi_term_case_insensitive_across_repos() {
+        let mut a = picker_app();
+        a.open_picker();
+        assert_eq!(a.picker_items().len(), 3, "empty query lists every agent");
+        a.picker.query = "TASK  b1".into();
+        assert_eq!(a.picker_items(), vec![TreeItem::Agent(1, 0)]);
+        a.picker.query = format!("{} resumable", a.workspaces[0].name());
+        assert_eq!(a.picker_items(), vec![TreeItem::Agent(0, 0)]);
+        a.picker.query = "nomatch".into();
+        assert!(a.picker_items().is_empty());
+    }
+
+    #[test]
+    fn picker_pick_and_cancel_modes() {
+        let mut a = picker_app();
+        a.open_picker();
+        a.picker.cursor = 2;
+        a.picker_pick();
+        assert_eq!(a.mode, Mode::Normal, "non-live row selects in the list");
+        assert_eq!(a.tree_cursor(), TreeItem::Agent(1, 1));
+        a.workspaces[1].rows[0].interactive = true;
+        a.workspaces[1].rows[0].status = "running".into();
+        a.open_picker();
+        a.picker.cursor = 1;
+        a.picker_pick();
+        assert_eq!(a.mode, Mode::Terminal, "live row opens its chat");
+        a.mode = Mode::Terminal;
+        a.open_picker();
+        assert_eq!(a.picker.ret, Mode::Terminal);
+        assert_eq!(Mode::Picker, a.mode);
     }
 
     #[test]

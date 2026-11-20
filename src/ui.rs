@@ -165,6 +165,7 @@ fn draw_inner(f: &mut Frame, app: &App) {
         Mode::ConfirmRemove => draw_confirm_remove(f, app),
         Mode::ConfirmClear => draw_confirm_clear(f, app),
         Mode::Rename => draw_rename(f, app),
+        Mode::Picker => draw_picker(f, app),
         _ => {}
     }
     if app.leader_pending {
@@ -221,6 +222,48 @@ fn draw_confirm_clear(f: &mut Frame, app: &App) {
     ];
     f.render_widget(Paragraph::new(lines)
         .block(dialog(Span::styled(" confirm clear ", Style::default().fg(Color::Red)))), area);
+}
+
+fn draw_picker(f: &mut Frame, app: &App) {
+    let area = centered(70, 60, f.area());
+    f.render_widget(Clear, area);
+    let items = app.picker_items();
+    let total: usize = app.workspaces.iter().map(|w| w.rows.len()).sum();
+    let count = format!("{}/{} ", items.len().min(app.picker.cursor + 1), total);
+    let block = dialog(Span::styled(" agents ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
+        .title_bottom(Line::from(Span::styled(" [enter] open  [esc] cancel ", Style::default().fg(Color::DarkGray))))
+        .title_bottom(Line::from(Span::styled(count, Style::default().fg(Color::DarkGray))).right_aligned());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 { return; }
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(ACCENT)),
+            Span::raw(format!("{}▏", app.picker.query)),
+        ])),
+        Rect { height: 1, ..inner },
+    );
+    let list = Rect { y: inner.y + 1, height: inner.height - 1, ..inner };
+    let h = list.height as usize;
+    let cur = app.picker.cursor.min(items.len().saturating_sub(1));
+    let top = (cur + 1).saturating_sub(h);
+    let w = list.width as usize;
+    let lines: Vec<Line> = items.iter().enumerate().skip(top).take(h).filter_map(|(n, it)| {
+        let TreeItem::Agent(i, j) = *it else { return None };
+        let r = &app.workspaces[i].rows[j];
+        let st = r.status_label();
+        let sel = n == cur;
+        let hl = |s: Style| if sel { Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD) } else { s };
+        let repo = format!("{:<14}", truncate(&app.workspaces[i].name(), 14));
+        let task_w = w.saturating_sub(14 + 1 + 2 + 2 + r.harness.chars().count() + 1);
+        Some(Line::from(vec![
+            Span::styled(repo, hl(Style::default().fg(Color::DarkGray))),
+            Span::styled(format!(" {} ", status_icon(st)), hl(Style::default().fg(status_color(st)))),
+            Span::styled(format!("{:<task_w$} ", truncate(r.display(), task_w)), hl(Style::default())),
+            Span::styled(r.harness.clone(), hl(Style::default().fg(harness_color(&r.harness)))),
+        ]))
+    }).collect();
+    f.render_widget(Paragraph::new(lines), list);
 }
 
 fn draw_rename(f: &mut Frame, app: &App) {
@@ -713,6 +756,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Normal | Mode::Filter if !app.agent_selected() => "REPO — [j/k] move · [l] first agent · [n]ew agent · [w] pin folder · [x] unpin · [?] help",
         // most-needed first: narrow terminals cut from the right
         Mode::Normal | Mode::Filter => "[?]help [n]ew [enter]chat/resume [q]uit [j/k]move [h]repo [d]iff [P]ush [s]top [x]rm [z]oom",
+        Mode::Picker => "PICK AN AGENT — type to filter · [^n/^p] move · [enter] open · [esc] cancel",
         _ => "", // modals carry their own key hints
     };
     f.render_widget(
@@ -1182,6 +1226,20 @@ mod tests {
 
     fn buffer_text(term: &Terminal<TestBackend>) -> String {
         term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn renders_picker_with_query() {
+        let store = Store::new(PathBuf::from("/tmp/myrepo"), PathBuf::from("/tmp/myrepo/scripts"));
+        let mut app = App::new(store);
+        app.open_picker();
+        app.picker.query = "needle".into();
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains(" agents "));
+        assert!(text.contains("> needle"));
+        assert!(text.contains("[esc] cancel"));
     }
 
     #[test]
