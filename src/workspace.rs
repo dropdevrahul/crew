@@ -28,6 +28,9 @@ pub struct GlobalConfig {
     /// Where agents run: "auto" (tmux if installed), "tmux", or "pty".
     #[serde(default)]
     pub backend: String,
+    /// Color theme name (see theme.rs); empty = terminal default.
+    #[serde(default)]
+    pub theme: String,
 }
 
 /// Resolve the global config path: `$XDG_CONFIG_HOME/crew/workspaces.json`,
@@ -103,6 +106,7 @@ mod tests {
         let cfg = GlobalConfig {
             version: 1,
             backend: "pty".into(),
+            theme: "nord".into(),
             active: 1,
             workspaces: vec![
                 WorkspaceEntry { path: "/a".into(), name: "a".into() },

@@ -29,6 +29,15 @@ agents run inside crew and stop when it exits (it asks first).
 Pick the backend in settings (`,` → *backend*: auto / tmux / pty), or per run
 with `CREW_BACKEND=pty crew`. `crew --doctor` shows which one is active.
 
+## Themes
+
+Settings (`,` → *theme*, live preview, `esc` reverts) or `CREW_THEME=dracula crew`.
+Built in: `default` (your terminal's colors), `catppuccin` (mocha), `dracula`,
+`gruvbox`, `nord`, `tokyonight`, `onedark`, `solarized` — palettes from each
+project's MIT-licensed terminal ports. A theme is a terminal palette (fg, bg,
+ANSI 0–15) applied to the whole screen, embedded agent terminals included;
+256-color and truecolor output passes through unchanged, as in any terminal.
+
 **Resume.** Each launch is persisted to `.crew/agents.json` and its worktree
 kept. An agent that exits or is stopped shows as **▷ resumable** (its last
 screen stays in the preview) — `enter` relaunches it in the same worktree.

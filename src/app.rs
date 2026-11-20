@@ -517,7 +517,7 @@ impl Workspace {
         self.mode = Mode::Settings;
     }
     pub fn settings_move(&mut self, d: i64) {
-        self.settings_field = (((self.settings_field as i64 + d) % 5 + 5) % 5) as usize;
+        self.settings_field = (((self.settings_field as i64 + d) % 6 + 6) % 6) as usize;
     }
     pub fn settings_change(&mut self, d: i64) {
         let Some(p) = self.settings.as_mut() else { return };
@@ -536,6 +536,7 @@ impl Workspace {
                 p.workflow_idx = (((p.workflow_idx as i64 + d) % n + n) % n) as usize;
             }
             3 => p.worktree_new = !p.worktree_new,
+            5 => crate::theme::cycle(d), // live preview; esc reverts
             _ => {
                 const B: [&str; 3] = ["auto", "tmux", "pty"];
                 let i = B.iter().position(|b| *b == self.settings_backend).unwrap_or(0) as i64;
@@ -555,12 +556,17 @@ impl Workspace {
                 crate::workspace::save_global(&g);
                 crate::pty::set_backend(crate::pty::resolve_backend(&g.backend));
             }
+            if g.theme != crate::theme::current() {
+                g.theme = crate::theme::current().into();
+                crate::workspace::save_global(&g);
+            }
             self.status_msg = "settings saved".into();
         }
         self.mode = Mode::Normal;
     }
     pub fn cancel_settings(&mut self) {
         self.settings = None;
+        crate::theme::set(&theme_setting(&crate::workspace::load_global()));
         self.mode = Mode::Normal;
     }
 
@@ -1918,6 +1924,7 @@ impl App {
         let cfg = crate::workspace::GlobalConfig {
             version: 1,
             backend: crate::workspace::load_global().backend, // owned by settings
+            theme: crate::workspace::load_global().theme,
             active: self.active,
             workspaces: self
                 .workspaces
@@ -2877,4 +2884,9 @@ mod tests {
         assert!(p.contains("fix the header"));
         assert!(p.contains("[image] /tmp/shot.png"));
     }
+}
+
+/// Theme to use: `CREW_THEME` overrides the saved setting.
+pub fn theme_setting(cfg: &crate::workspace::GlobalConfig) -> String {
+    std::env::var("CREW_THEME").unwrap_or_else(|_| cfg.theme.clone())
 }

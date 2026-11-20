@@ -11,6 +11,7 @@
 mod agent;
 mod app;
 mod pty;
+mod theme;
 mod store;
 mod ui;
 mod workspace;
@@ -71,6 +72,7 @@ fn main() -> Result<()> {
     // where agents live: CREW_BACKEND overrides the saved setting (auto|tmux|pty)
     let be = std::env::var("CREW_BACKEND").unwrap_or_else(|_| cfg.backend.clone());
     pty::set_backend(pty::resolve_backend(&be));
+    theme::set(&app::theme_setting(&cfg));
     let mut app = if cfg.workspaces.is_empty() {
         let cwd = std::env::current_dir()?;
         let a = App::new(workspace::store_for_path(&cwd, scripts_override.as_deref()));

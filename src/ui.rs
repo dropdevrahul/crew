@@ -126,6 +126,11 @@ fn status_icon(status: &str) -> &'static str {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    draw_inner(f, app);
+    crate::theme::apply(f.buffer_mut()); // palette remap, last
+}
+
+fn draw_inner(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)])
@@ -254,6 +259,7 @@ fn draw_settings(f: &mut Frame, app: &App) {
             "pty" => "pty — agents stop when crew exits",
             _ => "auto — tmux if installed, else pty",
         })),
+        row(5, "theme", crate::theme::current()),
         Line::from(""),
         Line::from(Span::styled("  [tab] field   [←→] change   [enter] save   [esc] cancel",
             Style::default().fg(Color::DarkGray))),
