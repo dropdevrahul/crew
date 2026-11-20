@@ -902,11 +902,11 @@ fn draw_help(f: &mut Frame, app: &App) {
     // grouped cheatsheet (lazygit-style): (section, [(keys, desc)])
     let groups: [(&str, &[(&str, &str)]); 7] = [
         ("Leader & picker", &[
-            ("Space / ^Space", "leader: dashboard / in a chat, then a key:"),
+            ("^q", "leader (dashboard and chat), then a key:"),
             ("  q · Tab", "back (leave chat / quit) · agent picker"),
             ("  n · d · P", "new agent · diff · push"),
             ("  s · z · ? · ,", "stop · zoom · help · settings"),
-            ("^p", "agent picker: type to filter · enter opens"),
+            ("^p · ^Tab", "agent picker: type to filter · enter opens"),
         ]),
         ("Navigate (vim)", &[
             ("j / k · ↑ / ↓", "move"),

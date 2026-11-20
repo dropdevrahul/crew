@@ -64,10 +64,10 @@ pub struct Leader {
 }
 
 fn default_key() -> String {
-    "space".into()
+    "ctrl-q".into()
 }
 fn default_chat_key() -> String {
-    "ctrl-space".into()
+    "ctrl-q".into()
 }
 fn default_bindings() -> Vec<(String, Action)> {
     [
@@ -184,7 +184,7 @@ mod tests {
     fn partial_config_loads() {
         let l: Leader = serde_json::from_str(r#"{"key":"ctrl-g"}"#).unwrap();
         assert_eq!(l.key, "ctrl-g");
-        assert_eq!(l.chat_key, "ctrl-space");
+        assert_eq!(l.chat_key, "ctrl-q");
         assert_eq!(l.bindings.len(), 9);
     }
 }

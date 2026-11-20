@@ -124,7 +124,7 @@ fn main() -> Result<()> {
                     mk("dark-mode", "cursor", "done", "add dark-mode toggle to settings", 0.19, 3600.0),
                 ];
                 app.apply_filter();
-                app.selected = 0;
+                app.set_tree(app::TreeItem::Agent(0, 0));
                 app.marked.insert("auth-mw".into());
                 app.marked.insert("flaky-test".into());
             }
@@ -455,9 +455,18 @@ fn run_suspended(terminal: &mut Term, cwd: &str, argv: &[String]) -> Result<()> 
     Ok(())
 }
 
+fn is_ctrl_tab(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// In Terminal mode every key is forwarded to the agent's PTY, except the
 /// detach key, Ctrl-q (Ctrl-o belongs to Claude Code's transcript toggle).
 fn handle_terminal_key(app: &mut App, key: KeyEvent) {
+    // Ctrl-Tab: straight to the agent picker (needs a terminal that reports it,
+    // i.e. the kitty keyboard protocol; elsewhere use the leader + Tab)
+    if !app.leader_pending && is_ctrl_tab(&key) {
+        return app.open_picker();
+    }
     if app.leader_pending || leader::key_matches(&app.leader.chat_key, &key) {
         return leader_key(app, key);
     }
@@ -646,6 +655,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let page = app.term_size.1.max(4) as i64;
     match app.mode {
         Mode::Normal => {
+            if !app.leader_pending && is_ctrl_tab(&key) {
+                return app.open_picker();
+            }
             if app.leader_pending || leader::key_matches(&app.leader.key, &key) {
                 return leader_key(app, key);
             }
@@ -1084,7 +1096,7 @@ mod tests {
     #[test]
     fn leader_q_on_dashboard_requests_quit() {
         let mut a = app();
-        handle_key(&mut a, ch(' '));
+        handle_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert!(a.leader_pending);
         handle_key(&mut a, ch('q'));
         assert!(!a.leader_pending);
@@ -1094,7 +1106,7 @@ mod tests {
     #[test]
     fn leader_in_chat_leaves_and_unknown_cancels() {
         let mut a = app();
-        let chat_key = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        let chat_key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
         a.mode = Mode::Terminal;
         handle_terminal_key(&mut a, chat_key);
         assert!(a.leader_pending);
@@ -1195,12 +1207,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_reaches_the_agent_ctrl_q_detaches() {
+    fn ctrl_o_reaches_the_agent_leader_q_detaches() {
         let mut a = app();
         a.mode = Mode::Terminal;
         handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(a.mode, Mode::Terminal, "Ctrl-o is Claude's transcript key");
         handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())); // leader, then q = back
         assert_eq!(a.mode, Mode::Normal);
     }
 
@@ -1233,6 +1246,19 @@ mod tests {
     fn alt_key_sends_esc_prefix() {
         let b = key_to_bytes(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
         assert_eq!(b, b"\x1bb");
+    }
+
+    #[test]
+    fn ctrl_tab_opens_picker_from_chat_and_dashboard() {
+        let ct = KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL);
+        let mut a = app();
+        a.mode = Mode::Terminal;
+        handle_terminal_key(&mut a, ct);
+        assert_eq!(a.mode, Mode::Picker);
+        assert_eq!(a.picker.ret, Mode::Terminal);
+        a.mode = Mode::Normal;
+        handle_key(&mut a, ct);
+        assert_eq!(a.mode, Mode::Picker);
     }
 
     #[test]
@@ -1365,6 +1391,7 @@ mod tests {
         // forward a keystroke to the PTY, then leave the terminal (Ctrl-q)
         handle_terminal_key(&mut a, ch('x'));
         handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())); // leader, then q = back
         assert_eq!(a.mode, Mode::Normal);
 
         // review its worktree diff (dir isn't a git repo → friendly message)
@@ -1392,6 +1419,7 @@ mod tests {
         assert_eq!(a.agents.len(), 1, "dead proc replaced, not duplicated");
         assert!(a.agents[0].is_alive());
         handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty())); // leader, then q = back
         a.stop_all();
         std::thread::sleep(std::time::Duration::from_millis(200));
         std::env::remove_var("CREW_RESUME_CMD_CLAUDE");

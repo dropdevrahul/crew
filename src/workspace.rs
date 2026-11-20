@@ -104,8 +104,8 @@ mod tests {
     #[test]
     fn old_config_without_leader_gets_defaults() {
         let cfg: GlobalConfig = serde_json::from_str(r#"{"version":1,"active":0,"workspaces":[]}"#).unwrap();
-        assert_eq!(cfg.leader.key, "space");
-        assert_eq!(cfg.leader.chat_key, "ctrl-space");
+        assert_eq!(cfg.leader.key, "ctrl-q");
+        assert_eq!(cfg.leader.chat_key, "ctrl-q");
     }
 
     #[test]

@@ -5,7 +5,7 @@ agents across harnesses (Claude / OpenCode / Cursor). Rust + [ratatui].
 
 Each agent runs its harness's interactive REPL inside a **PTY that the dashboard
 owns**, rendered in an **embedded terminal pane** (via `portable-pty` + `vt100`). Select an agent and press `enter` to drop into its terminal — you
-chat **inside the TUI**, side-by-side with the agent list; `Ctrl-q` returns to the
+chat **inside the TUI**, side-by-side with the repo/agent tree; `Ctrl-q q` returns to the
 dashboard. No switching windows. With tmux installed, agents keep running after
 you quit crew and re-attach on the next launch.
 
@@ -133,26 +133,27 @@ Environment:
 
 ## Layout
 
-Three panes: pinned repos (plus an **all** view), the agent list, and a live
-preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot`:
+Two panes: a tree of pinned repos with each repo's agents nested under it (plus
+an **all** row), and a live preview / embedded chat. Real output of
+`CREW_SNAPSHOT_MODE=demo crew --snapshot`:
 
 ```
- crew  all · 1 repo · 5 agents  ●2 ✓2 ✗1  $1.050  ◉ 2 marked
-╭ repos (1) ───╮╭ agents · all (5) ───────────────╮╭ preview ──────────────────────────────────────╮
-│▶ ◆ all       ││▶   ⠙   add billing da… $0.42 12s││add billing dashboard endpoint                 │
-│  › myapp     ││  ◉ ⠙   add auth middl… $0.31 40s││                                               │
-│              ││  ◉ ✗   fix flaky timez… $0.08 2m││status   ⠙ running                             │
-│              ││    ✓   rewrite the RE… $0.05 10m││repo     myapp                                 │
-│              ││    ✓   add dark-mode t… $0.19 1h││harness  cursor · sonnet                       │
-│              ││                                 ││branch   crew/billing-api                      │
-│              ││                                 ││cost     $0.420                                │
-│              ││                                 ││running  12s ago                               │
-│              ││                                 ││worktree .crew/worktrees/billing-api           │
-│              ││                                 ││                                               │
-│              ││                                 ││[enter] log · [d]iff [L]og [e]dit [!]shell     │
-│              ││                                 ││[P]ush [R]etry [x]rm                           │
-╰──────────────╯╰─────────────────────────────────╯╰───────────────────────────────────────────────╯
-[?]help [n]ew [enter]chat/resume [q]uit [j/k]move [h/l]panes [d]iff [P]ush [s]top [x]rm [z]oom
+ crew  myapp  main · 5 agents  ●2 ✓2 ✗1  $1.050  ◉ 2 marked
+╭ repos (1) · agents (5) ────────╮╭ preview ───────────────────────────────────────────────────────╮
+│  ◆ all                         ││add billing dashboard endpoint                                  │
+│  ▾ › myapp                     ││                                                                │
+│▶   ⠹   add billing d… $0.42 12s││status   ⠹ running                                              │
+│  ◉ ⠹   add auth midd… $0.31 40s││repo     myapp                                                  │
+│  ◉ ✗   fix flaky time… $0.08 2m││harness  cursor · sonnet                                        │
+│    ✓   rewrite the R… $0.05 10m││branch   crew/billing-api                                       │
+│    ✓   add dark-mode … $0.19 1h││cost     $0.420                                                 │
+│                                ││running  12s ago                                                │
+│                                ││worktree .crew/worktrees/billing-api                            │
+│                                ││                                                                │
+│                                ││[enter] log · [d]iff [L]og [e]dit [!]shell [P]ush [R]etry [x]rm │
+│                                ││                                                                │
+╰────────────────────────────────╯╰────────────────────────────────────────────────────────────────╯
+[?]help [n]ew [enter]chat/resume [q]uit [j/k]move [h]repo [d]iff [P]ush [s]top [x]rm [z]oom
 ```
 
 `n` opens the new-agent form (`CREW_SNAPSHOT_MODE=new`):
@@ -232,10 +233,10 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
 | `j`/`k` or `↑`/`↓` | move through the repo → agents tree · `g`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` half page · `Ctrl-f`/`Ctrl-b` page |
 | `h`/`l` or `←`/`→` | `h` climbs from an agent to its repo · `l` steps from a repo into its agents (or opens the agent) |
 | `]`/`[` | next/prev **failed** agent |
-| `space` | **leader** key (see *Leader key* below); no longer marks a row |
+| `space` | mark / unmark the row and advance |
+| `Ctrl-q` | **leader** key, on the dashboard and in a chat (see *Leader key* below) |
 | `A` | mark all visible rows for bulk ops |
-| `Ctrl-p` | agent picker (see *Agent picker* below) |
-| `Ctrl-space` | (in chat) **leader** key; `Ctrl-q` still leaves the chat |
+| `Ctrl-p` · `Ctrl-Tab` | agent picker (see *Agent picker* below); Ctrl-Tab also works inside a chat, in terminals that report it (kitty protocol: Ghostty, kitty, WezTerm, iTerm2) |
 | `esc` | peel one layer: marks → search → category |
 | mouse click / wheel | select a row · scroll · click the terminal pane to chat |
 | `1` `2` `3` `4` | quick-filter: all / running / agents / sessions |
@@ -266,8 +267,8 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
 
 ### Leader key
 
-Press the leader, then one key. It is `Space` on the dashboard and `Ctrl-Space`
-inside a chat (`Ctrl-q` still leaves a chat). A which-key popup lists the bindings:
+Press the leader, then one key. It is `Ctrl-q`, on the dashboard and inside a
+chat. A which-key popup lists the bindings:
 
 | after the leader | action |
 |---|---|
@@ -281,7 +282,7 @@ Remap it in `~/.config/crew/workspaces.json` (or `$XDG_CONFIG_HOME/crew/`) with 
 `leader` block. `key` is the dashboard leader, `chat_key` the in-chat one, and
 `bindings` maps a key to an action name (`back`, `agents`, `new_agent`, `diff`,
 `push`, `stop`, `zoom`, `help`, `settings`). Key specs: `space`, `tab`, `enter`,
-`esc`, `ctrl-<key>` (including `ctrl-space`), or a single character. Missing fields
+`esc`, `ctrl-<key>` (including `ctrl-space`; some terminals and macOS swallow it), or a single character. Missing fields
 keep their defaults, but a `bindings` list replaces all of them.
 
 ```json
@@ -292,13 +293,12 @@ keep their defaults, but a `bindings` list replaces all of them.
 }
 ```
 
-Space is the leader by default, so it no longer marks a row. Set `leader.key` to
-another key, as above, to get single-row marking back with `space`.
+To use `Space` as the dashboard leader instead, set `"key": "space"` (it then no
+longer marks rows). Inside a chat Space is typed text, so keep a `ctrl-` key for `chat_key`.
 
 ### Agent picker
 
-`Space Tab` opens the agent picker on the dashboard (`Ctrl-Space Tab` in a chat,
-or `Ctrl-p` on the dashboard). Type to filter by repo, task, harness or status;
+`Ctrl-q Tab` opens the agent picker, as does `Ctrl-Tab` (also from inside a chat, where the terminal supports it) or `Ctrl-p` on the dashboard. Type to filter by repo, task, harness or status;
 every word you type must match. `Up`/`Down` or `Ctrl-n`/`Ctrl-p` move, `Enter`
 opens the agent (a live agent goes straight to its chat), and `Esc` cancels.
 
