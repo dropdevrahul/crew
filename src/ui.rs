@@ -167,6 +167,25 @@ fn draw_inner(f: &mut Frame, app: &App) {
         Mode::Rename => draw_rename(f, app),
         _ => {}
     }
+    if app.leader_pending {
+        draw_which_key(f, app);
+    }
+}
+
+/// Which-key overlay (bottom-right) while the leader key is armed.
+fn draw_which_key(f: &mut Frame, app: &App) {
+    let b = &app.leader.bindings;
+    let full = f.area();
+    let w = 26.min(full.width);
+    let h = (b.len() as u16 + 2).min(full.height);
+    let area = Rect { x: full.right().saturating_sub(w), y: full.bottom().saturating_sub(h + 1), width: w, height: h };
+    f.render_widget(Clear, area);
+    let lines: Vec<Line> = b.iter().map(|(k, a)| Line::from(vec![
+        Span::styled(format!("{:<6}", crate::leader::spec_label(k)), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw(a.name().replace('_', " ")),
+    ])).collect();
+    f.render_widget(Paragraph::new(lines)
+        .block(dialog(Span::styled(" leader ", Style::default().fg(ACCENT)))), area);
 }
 
 fn draw_confirm_remove(f: &mut Frame, app: &App) {
@@ -543,7 +562,7 @@ fn draw_terminal(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     let live = app.selected_row().map(|r| r.is_live()).unwrap_or(false);
     let zoom = if app.zoom { "[z] unzoom" } else { "[z] zoom" };
     let title = if focused {
-        " chat · typing goes to the agent · [Ctrl-q] leave ".to_string()
+        format!(" chat · typing goes to the agent · [{}] leader ", crate::leader::spec_label(&app.leader.chat_key))
     } else if live {
         format!(" terminal · [enter/l] chat · {} ", zoom)
     } else {
@@ -685,8 +704,9 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let chat = format!("CHAT — [{}] leader · q back · Tab agents · [wheel / Shift-PgUp] history · [Shift-drag] select text · [shift-tab] agent modes", crate::leader::spec_label(&app.leader.chat_key));
     let keys = match app.mode {
-        Mode::Terminal => "CHAT — [Ctrl-q] back to list · [wheel / Shift-PgUp] history · [Shift-drag] select text · [shift-tab] agent modes",
+        Mode::Terminal => chat.as_str(),
         Mode::Diff => "DIFF — [j/k] line [^d/^u] half [^f/^b] page [g/G] ends [/] search [n/N] next   ·   [q/esc] close",
         Mode::Log => "LOG — [j/k] line [^d/^u] half [g/G] ends (G follows) [/] search [r]eload   ·   [q/esc] close",
         Mode::BrowseFolder => "PIN A REPO — [j/k] move · [l/enter] open · [h/bksp] up · [a] pin · [/] type path · [esc] cancel",

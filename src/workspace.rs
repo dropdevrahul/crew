@@ -31,6 +31,9 @@ pub struct GlobalConfig {
     /// Color theme name (see theme.rs); empty = terminal default.
     #[serde(default)]
     pub theme: String,
+    /// Leader-key bindings (see leader.rs).
+    #[serde(default)]
+    pub leader: crate::leader::Leader,
 }
 
 /// Resolve the global config path: `$XDG_CONFIG_HOME/crew/workspaces.json`,
@@ -99,6 +102,13 @@ mod tests {
     }
 
     #[test]
+    fn old_config_without_leader_gets_defaults() {
+        let cfg: GlobalConfig = serde_json::from_str(r#"{"version":1,"active":0,"workspaces":[]}"#).unwrap();
+        assert_eq!(cfg.leader.key, "space");
+        assert_eq!(cfg.leader.chat_key, "ctrl-space");
+    }
+
+    #[test]
     fn config_round_trips() {
         let tmp = std::env::temp_dir().join(format!("crew-wscfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -108,6 +118,7 @@ mod tests {
             backend: "pty".into(),
             theme: "nord".into(),
             active: 1,
+            leader: Default::default(),
             workspaces: vec![
                 WorkspaceEntry { path: "/a".into(), name: "a".into() },
                 WorkspaceEntry { path: "/b".into(), name: "b".into() },

@@ -10,6 +10,7 @@
 
 mod agent;
 mod app;
+mod leader;
 mod pty;
 mod theme;
 mod store;
@@ -453,9 +454,11 @@ fn run_suspended(terminal: &mut Term, cwd: &str, argv: &[String]) -> Result<()> 
 /// In Terminal mode every key is forwarded to the agent's PTY, except the
 /// detach key, Ctrl-q (Ctrl-o belongs to Claude Code's transcript toggle).
 fn handle_terminal_key(app: &mut App, key: KeyEvent) {
-    if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.mode = Mode::Normal;
-        return;
+    if app.leader_pending || leader::key_matches(&app.leader.chat_key, &key) {
+        return leader_key(app, key);
+    }
+    if leader::key_matches("ctrl-q", &key) {
+        return run_action(app, leader::Action::Back); // legacy leave key
     }
     // Shift-PgUp/PgDn page through the chat's history (not sent to the agent)
     if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -492,6 +495,46 @@ fn vim_delta(key: &KeyEvent, page: i64) -> Option<i64> {
         KeyCode::Char('G') | KeyCode::End => i64::MAX / 2,
         _ => return None,
     })
+}
+
+/// Leader flow: the first key arms `leader_pending`, the next one runs its
+/// bound action (Esc / unknown keys cancel). Swallows keys while pending.
+fn leader_key(app: &mut App, key: KeyEvent) {
+    if !app.leader_pending {
+        app.leader_pending = true;
+        return;
+    }
+    app.leader_pending = false;
+    match app.leader.lookup(&key) {
+        Some(action) => run_action(app, action),
+        None if key.code == KeyCode::Esc => app.status_msg = "leader cancelled".into(),
+        None => app.status_msg = format!("no leader binding for '{}'", leader::key_label(&key)),
+    }
+}
+
+fn run_action(app: &mut App, action: leader::Action) {
+    use leader::Action::*;
+    match action {
+        Back if app.mode == Mode::Terminal => app.mode = Mode::Normal,
+        Back => request_quit(app),
+        Agents => app.open_picker(),
+        NewAgent => app.open_new_agent(),
+        Zoom => app.zoom = !app.zoom,
+        Help => { app.help_scroll = 0; app.mode = Mode::Help; }
+        Settings => app.open_settings(),
+        _ if !app.agent_selected() => app.status_msg = "select an agent first".into(),
+        Diff => app.show_diff(),
+        Push => app.open_push(),
+        Stop => {
+            let has_live = app.marked_total() > 0
+                || app.selected_row().map(|r| r.interactive).unwrap_or(false);
+            if has_live {
+                app.mode = Mode::ConfirmStop;
+            } else {
+                app.status_msg = "only interactive agents can be stopped".into();
+            }
+        }
+    }
 }
 
 fn request_quit(app: &mut App) {
@@ -565,6 +608,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let page = app.term_size.1.max(4) as i64;
     match app.mode {
         Mode::Normal => {
+            if app.leader_pending || leader::key_matches(&app.leader.key, &key) {
+                return leader_key(app, key);
+            }
             // One tree: j/k walk repos and their agents. Agent keys only act on
             // an agent line, so a repo line can never trigger one by accident.
             if let Some(d) = vim_delta(&key, page) {
@@ -976,6 +1022,34 @@ mod tests {
     }
     fn esc() -> KeyEvent {
         KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn leader_q_on_dashboard_requests_quit() {
+        let mut a = app();
+        handle_key(&mut a, ch(' '));
+        assert!(a.leader_pending);
+        handle_key(&mut a, ch('q'));
+        assert!(!a.leader_pending);
+        assert_eq!(a.mode, Mode::ConfirmQuit);
+    }
+
+    #[test]
+    fn leader_in_chat_leaves_and_unknown_cancels() {
+        let mut a = app();
+        let chat_key = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        a.mode = Mode::Terminal;
+        handle_terminal_key(&mut a, chat_key);
+        assert!(a.leader_pending);
+        handle_terminal_key(&mut a, ch('q'));
+        assert_eq!(a.mode, Mode::Normal);
+
+        a.mode = Mode::Terminal;
+        handle_terminal_key(&mut a, chat_key);
+        handle_terminal_key(&mut a, ch('#'));
+        assert!(!a.leader_pending);
+        assert_eq!(a.mode, Mode::Terminal);
+        assert!(a.status_msg.contains("no leader binding"));
     }
 
     #[test]

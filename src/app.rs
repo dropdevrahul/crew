@@ -1482,6 +1482,9 @@ pub struct App {
     pub zoom: bool,
     pub should_quit: bool,
     pub browser: WorkspaceBrowser,
+    pub leader: crate::leader::Leader,
+    /// The leader key was pressed; the next key picks the action.
+    pub leader_pending: bool,
     /// Round-robin index for background full refreshes (engine rows).
     bg_full: usize,
 }
@@ -1491,6 +1494,7 @@ impl App {
         App {
             workspaces, active, on_agent: false, view_all: true, cwd_ws: None, zoom: false,
             should_quit: false, browser: WorkspaceBrowser::default(), bg_full: 0,
+            leader: Default::default(), leader_pending: false,
         }
     }
 
@@ -1514,7 +1518,14 @@ impl App {
             workspaces.push(crate::workspace::workspace_from_path(&cwd, scripts));
         }
         let active = cfg.active.min(workspaces.len() - 1);
-        App::shell(workspaces, active)
+        let mut app = App::shell(workspaces, active);
+        app.leader = cfg.leader.clone();
+        app
+    }
+
+    /// Stub for `Action::Agents` until the real agent picker lands.
+    pub fn open_picker(&mut self) {
+        self.status_msg = "agent picker not built yet".into();
     }
 
     /// Note the launch folder: pin it quietly if it's an unpinned git repo
@@ -1898,6 +1909,7 @@ impl App {
             backend: crate::workspace::load_global().backend, // owned by settings
             theme: crate::workspace::load_global().theme,
             active: self.active,
+            leader: self.leader.clone(),
             workspaces: self
                 .workspaces
                 .iter()
