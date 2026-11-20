@@ -45,11 +45,13 @@ pub enum Mode {
     BrowseFolder,
 }
 
-/// Which pane the keyboard drives in Normal mode. Tab toggles between them.
+/// One line of the left tree: "all", a repo, or one of that repo's agents
+/// (`Agent(workspace, row index in that workspace's list)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    Workspaces,
-    Agents,
+pub enum TreeItem {
+    All,
+    Repo(usize),
+    Agent(usize, usize),
 }
 
 /// Folder-browser state for `Mode::BrowseFolder`. Shows the folders under `cwd`
@@ -795,19 +797,6 @@ impl Workspace {
         self.agents.get_mut(idx)
     }
 
-    pub fn move_sel(&mut self, delta: i64) {
-        if self.rows.is_empty() {
-            return;
-        }
-        let n = self.rows.len() as i64;
-        let i = (self.selected as i64 + delta).clamp(0, n - 1);
-        self.selected = i as usize;
-        // NB: don't probe git here — scrolling must stay smooth. The selected
-        // worktree's status refreshes on the next tick (≤800ms).
-    }
-
-
-
     /// Copy the selected agent's worktree path to the system clipboard.
     pub fn yank_worktree(&mut self) {
         let Some(wt) = self.selected_row().and_then(|r| r.worktree.clone()) else {
@@ -1482,15 +1471,15 @@ pub struct App {
     /// Index of the workspace actions target. In the all-repos view it follows
     /// the selected row, so every per-workspace action just works.
     pub active: usize,
-    /// Cursor in the workspaces pane: 0 = "all", i+1 = workspaces[i].
-    pub ws_cursor: usize,
+    /// The tree cursor is on an agent line (vs a repo line / "all"). The
+    /// cursor's position is derived from `view_all`, `active`, `selected`.
+    pub on_agent: bool,
     /// Show every workspace's agents in one list (the default home).
     pub view_all: bool,
     /// Workspace of the folder crew was launched from (default launch repo).
     pub cwd_ws: Option<usize>,
     /// Right pane takes the full width (roomier chat).
     pub zoom: bool,
-    pub focus: Focus,
     pub should_quit: bool,
     pub browser: WorkspaceBrowser,
     /// Round-robin index for background full refreshes (engine rows).
@@ -1500,8 +1489,8 @@ pub struct App {
 impl App {
     fn shell(workspaces: Vec<Workspace>, active: usize) -> App {
         App {
-            workspaces, active, ws_cursor: 0, view_all: true, cwd_ws: None, zoom: false,
-            focus: Focus::Agents, should_quit: false, browser: WorkspaceBrowser::default(), bg_full: 0,
+            workspaces, active, on_agent: false, view_all: true, cwd_ws: None, zoom: false,
+            should_quit: false, browser: WorkspaceBrowser::default(), bg_full: 0,
         }
     }
 
@@ -1594,52 +1583,17 @@ impl App {
         rows
     }
 
-    /// Position of the selected row within `visible_rows()`.
-    pub fn visible_index(&self, rows: &[Row]) -> usize {
-        let id = self.active().selected_row().map(|r| r.id.clone());
-        rows.iter().position(|r| r.ws == self.active && Some(&r.id) == id.as_ref()).unwrap_or(0)
-    }
-
-    /// Select `rows[i]`: switch to its workspace and point that list at it.
-    fn select_visible(&mut self, rows: &[Row], i: usize) {
-        let Some(r) = rows.get(i) else { return };
-        self.switch_active(r.ws);
-        let w = self.active_mut();
-        if let Some(j) = w.rows.iter().position(|x| x.id == r.id) {
-            w.selected = j;
-        }
-    }
-
-    pub fn move_sel(&mut self, d: i64) {
-        if !self.view_all {
-            return self.active_mut().move_sel(d);
-        }
-        let rows = self.visible_rows();
-        if rows.is_empty() {
-            return;
-        }
-        let i = (self.visible_index(&rows) as i64 + d).clamp(0, rows.len() as i64 - 1) as usize;
-        self.select_visible(&rows, i);
-    }
-    pub fn sel_top(&mut self) {
-        self.move_sel(i64::MIN / 2);
-    }
-    pub fn sel_bottom(&mut self) {
-        self.move_sel(i64::MAX / 2);
-    }
-    /// Select by on-screen list index (mouse).
-    pub fn select_index(&mut self, i: usize) {
-        let rows = self.visible_rows();
-        self.select_visible(&rows, i);
-    }
+    /// `]` / `[`: cursor to the next/prev failed agent, across repos.
     pub fn jump_failed(&mut self, dir: i64) {
-        let rows = self.visible_rows();
-        let n = rows.len();
-        let cur = self.visible_index(&rows);
-        for step in 1..=n {
-            let i = (cur as i64 + dir * step as i64).rem_euclid(n as i64) as usize;
-            if rows[i].status == "failed" {
-                return self.select_visible(&rows, i);
+        let t = self.tree();
+        let n = t.len() as i64;
+        let cur = t.iter().position(|x| *x == self.tree_cursor()).unwrap_or(0) as i64;
+        for step in 1..n {
+            let it = t[(cur + dir * step).rem_euclid(n) as usize];
+            if let TreeItem::Agent(i, j) = it {
+                if self.workspaces[i].rows[j].status == "failed" {
+                    return self.set_tree(it);
+                }
             }
         }
         self.status_msg = "no failed agents".into();
@@ -1656,7 +1610,7 @@ impl App {
                 w.marked.insert(id);
             }
         }
-        self.move_sel(1);
+        self.tree_move(1);
     }
     pub fn mark_all_visible(&mut self) {
         for r in self.visible_rows() {
@@ -1774,8 +1728,9 @@ impl App {
     }
     pub fn spawn_from_form(&mut self) {
         self.active_mut().spawn_from_form();
-        if self.mode == Mode::Terminal && !self.view_all {
-            self.ws_cursor = self.active + 1;
+        if self.mode == Mode::Terminal {
+            self.view_all = false;
+            self.on_agent = true; // the chat pane shows the agent just launched
         }
     }
 
@@ -1832,34 +1787,60 @@ impl App {
             .sum()
     }
 
-    /// Flip keyboard focus between the workspaces pane and the agents pane.
-    pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Agents => Focus::Workspaces,
-            Focus::Workspaces => Focus::Agents,
-        };
+    // ── the left tree: all · repo · its agents ──────────────────────────────
+    /// Every line of the tree, top to bottom.
+    pub fn tree(&self) -> Vec<TreeItem> {
+        let mut v = vec![TreeItem::All];
+        for (i, w) in self.workspaces.iter().enumerate() {
+            v.push(TreeItem::Repo(i));
+            v.extend((0..w.rows.len()).map(|j| TreeItem::Agent(i, j)));
+        }
+        v
     }
-
-    // ── workspaces pane navigation (row 0 = all) ────────────────────────────
-    pub fn ws_move(&mut self, d: i64) {
-        let n = self.workspaces.len() as i64 + 1;
-        self.ws_cursor = (self.ws_cursor as i64 + d).clamp(0, n - 1) as usize;
+    /// The line the cursor is on, derived from the view state.
+    pub fn tree_cursor(&self) -> TreeItem {
+        if self.view_all {
+            TreeItem::All
+        } else if self.on_agent && !self.active().rows.is_empty() {
+            TreeItem::Agent(self.active, self.active().selected.min(self.active().rows.len() - 1))
+        } else {
+            TreeItem::Repo(self.active)
+        }
     }
-    pub fn ws_top(&mut self) {
-        self.ws_cursor = 0;
+    /// Move the cursor onto `it`, retargeting the active repo / selected row.
+    pub fn set_tree(&mut self, it: TreeItem) {
+        match it {
+            TreeItem::All => { self.view_all = true; self.on_agent = false; }
+            TreeItem::Repo(i) => { self.view_all = false; self.on_agent = false; self.switch_active(i); }
+            TreeItem::Agent(i, j) => {
+                self.view_all = false;
+                self.on_agent = true;
+                self.switch_active(i);
+                self.active_mut().selected = j;
+            }
+        }
     }
-    pub fn ws_bottom(&mut self) {
-        self.ws_cursor = self.workspaces.len();
+    pub fn tree_move(&mut self, d: i64) {
+        let t = self.tree();
+        let pos = t.iter().position(|x| *x == self.tree_cursor()).unwrap_or(0) as i64;
+        self.set_tree(t[(pos + d).clamp(0, t.len() as i64 - 1) as usize]);
     }
-
-    /// Open the entry under the cursor: "all", or narrow to one workspace.
-    pub fn select_workspace(&mut self) {
-        if self.ws_cursor == 0 {
-            self.view_all = true;
-        } else if self.ws_cursor <= self.workspaces.len() {
-            self.view_all = false;
-            self.switch_active(self.ws_cursor - 1);
-            let _ = self.active_mut().refresh();
+    /// Cursor on a live-or-not agent line (agent keys apply only here).
+    pub fn agent_selected(&self) -> bool {
+        matches!(self.tree_cursor(), TreeItem::Agent(..))
+    }
+    /// vim `l`/enter on a repo line: step to its first agent.
+    pub fn tree_enter_repo(&mut self) {
+        if let TreeItem::Repo(i) = self.tree_cursor() {
+            if !self.workspaces[i].rows.is_empty() {
+                self.set_tree(TreeItem::Agent(i, 0));
+            }
+        }
+    }
+    /// vim `h` on an agent line: back up to its repo.
+    pub fn tree_up_to_repo(&mut self) {
+        if let TreeItem::Agent(i, _) = self.tree_cursor() {
+            self.set_tree(TreeItem::Repo(i));
         }
     }
 
@@ -1872,16 +1853,16 @@ impl App {
         let root = crate::store::git_toplevel(&path);
         if let Some(i) = self.workspaces.iter().position(|w| w.store.repo_root == root) {
             // already there → just go to it instead of erroring
-            self.ws_cursor = i + 1;
-            self.select_workspace();
+            self.set_tree(TreeItem::Repo(i));
+            let _ = self.active_mut().refresh();
             self.active_mut().status_msg = format!("{} is already pinned", self.workspaces[i].name());
             return Ok(());
         }
         let ws = crate::workspace::workspace_from_path(&path, None);
         self.workspaces.push(ws);
         let i = self.workspaces.len() - 1;
-        self.ws_cursor = i + 1;
-        self.select_workspace();
+        self.set_tree(TreeItem::Repo(i));
+        let _ = self.active_mut().refresh();
         self.save_global();
         Ok(())
     }
@@ -1904,19 +1885,17 @@ impl App {
         let fix = |i: usize| if i > idx { i - 1 } else { i };
         self.active = fix(self.active).min(self.workspaces.len() - 1);
         self.cwd_ws = self.cwd_ws.filter(|c| *c != idx).map(fix);
-        self.ws_cursor = self.ws_cursor.min(self.workspaces.len());
-        if self.ws_cursor == 0 {
-            self.view_all = true;
-        }
+        self.view_all = true;
+        self.on_agent = false;
         self.save_global();
     }
 
     pub fn remove_workspace_at_selected(&mut self) {
-        if self.ws_cursor == 0 {
-            self.active_mut().status_msg = "\"all\" isn't a pinned folder".into();
+        let TreeItem::Repo(i) = self.tree_cursor() else {
+            self.active_mut().status_msg = "put the cursor on a repo to unpin it".into();
             return;
-        }
-        self.remove_workspace(self.ws_cursor - 1);
+        };
+        self.remove_workspace(i);
     }
 
     /// Persist the pinned list + active index to the global config.
@@ -1999,7 +1978,6 @@ impl App {
             Ok(()) => {
                 self.browser.editing = false;
                 self.mode = Mode::Normal;
-                self.focus = Focus::Agents; // next thing you do is launch/inspect agents there
             }
             Err(e) => self.browser.error = Some(e.to_string()),
         }
@@ -2371,14 +2349,16 @@ mod tests {
         let rows = a.visible_rows();
         assert_eq!(rows.len(), 3, "rows from every workspace");
         // walking the merged list moves the action target across workspaces
-        a.sel_top();
+        a.set_tree(TreeItem::Agent(0, 0));
         let first = a.selected_row().unwrap().id.clone();
-        a.sel_bottom();
+        a.tree_move(i64::MAX / 2);
         let last = a.visible_rows().last().unwrap().clone();
+        assert_eq!(a.active, 1, "cursor walks across repos");
         assert_eq!(a.active, last.ws, "active follows the selected row");
         assert_eq!(a.selected_row().unwrap().id, last.id);
         assert_ne!(first, last.id);
         // marks span workspaces; a bulk remove hits each owner
+        a.set_tree(TreeItem::All);
         a.mark_all_visible();
         assert_eq!(a.marked_total(), 3);
         a.remove_selected();
@@ -2386,8 +2366,7 @@ mod tests {
         // narrowing to one workspace shows only its rows
         a.workspaces[1].registry.push(rec("b3", "/tmp"));
         a.workspaces[1].refresh().unwrap();
-        a.ws_cursor = 1; // workspaces[0]
-        a.select_workspace();
+        a.set_tree(TreeItem::Repo(0));
         assert!(!a.view_all);
         assert!(a.visible_rows().is_empty());
         let _ = (std::fs::remove_dir_all(&d1), std::fs::remove_dir_all(&d2));
@@ -2471,7 +2450,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("crew-unpin-{}", std::process::id()));
         let mut a = App::new(Store::new(d.clone(), d.join("s")));
         a.workspaces.push(Workspace::new(Store::new(d.join("b"), d.join("s"))));
-        a.ws_cursor = 0;
+        a.set_tree(TreeItem::All);
         a.remove_workspace_at_selected();
         assert_eq!(a.workspaces.len(), 2);
         let argv = vec!["cat".to_string()];
@@ -2754,7 +2733,7 @@ mod tests {
         });
         let mut a = app();
         a.rows = vec![mk("a"), mk("b"), mk("c")];
-        a.selected = 0;
+        a.set_tree(TreeItem::Agent(0, 0));
         a.toggle_mark(); // marks "a", advances to 1
         assert!(a.marked.contains("a"));
         assert_eq!(a.selected, 1);
@@ -2792,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    fn sel_top_and_bottom() {
+    fn tree_walks_agents() {
         use crate::agent::{ManagedAgent, Row};
         let mk = |id: &str| Row::from_managed(&ManagedAgent {
             agent_id: id.into(), harness: None, model: None, worktree: None,
@@ -2801,9 +2780,10 @@ mod tests {
         });
         let mut a = app();
         a.rows = vec![mk("a"), mk("b"), mk("c")];
-        a.sel_bottom();
+        a.set_tree(TreeItem::Agent(0, 0));
+        a.tree_move(i64::MAX / 2);
         assert_eq!(a.selected, 2);
-        a.sel_top();
+        a.tree_move(-2);
         assert_eq!(a.selected, 0);
     }
 

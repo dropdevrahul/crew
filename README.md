@@ -225,8 +225,8 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
 
 | key | action |
 |-----|--------|
-| `j`/`k` or `↑`/`↓` | move selection · `g`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` half page · `Ctrl-f`/`Ctrl-b` page |
-| `h`/`l` or `←`/`→` | focus the repos pane · drill in (chat / resume / log) — `Tab` also toggles panes |
+| `j`/`k` or `↑`/`↓` | move through the repo → agents tree · `g`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` half page · `Ctrl-f`/`Ctrl-b` page |
+| `h`/`l` or `←`/`→` | `h` climbs from an agent to its repo · `l` steps from a repo into its agents (or opens the agent) |
 | `]`/`[` | next/prev **failed** agent |
 | `space` / `A` | mark row / mark all for bulk ops |
 | `esc` | peel one layer: marks → search → category |
@@ -238,6 +238,7 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
 | `Ctrl-q` | leave the chat, back to the dashboard |
 | `z` | zoom the chat/preview pane to full width (toggle) |
 | `a` | back to the **all repos** view |
+| `shift-enter` | (in chat) newline in the agent's input (needs a terminal with the kitty keyboard protocol: Ghostty, kitty, WezTerm, iTerm2; `alt-enter` works everywhere) |
 | `shift-tab` | (in chat) forwarded to the agent — cycles Claude Code's modes (plan / auto-accept) |
 | `D` | duplicate the selected agent into a prefilled new-agent form |
 | `w` | pin another folder as a workspace (`x` in the repos pane unpins; the picker opens beside the current repo) |

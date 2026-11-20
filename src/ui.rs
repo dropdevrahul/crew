@@ -2,7 +2,7 @@
 //! selected agent's *embedded terminal* (interactive) or a preview (observed).
 
 use crate::agent::{rel_time, Kind};
-use crate::app::{App, Focus, Mode};
+use crate::app::{App, Mode, TreeItem};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -20,14 +20,11 @@ use ratatui::{
 const ACCENT: Color = Color::Cyan;
 const ACCENT_DIM: Color = Color::DarkGray;
 
-/// Widths of the workspaces and agents panes for a terminal `total` cols wide.
-/// The workspaces pane is sized to its names (it's a short list); the agents
-/// list — the main navigator — gets ~42% of the rest; the detail pane the remainder.
-pub fn pane_widths(app: &App, total: u16) -> (u16, u16) {
-    let longest = app.workspaces.iter().map(|w| w.name().chars().count()).max().unwrap_or(4) as u16;
-    let ws = (longest + 11).clamp(16, 28).min(total / 4);
-    let agents = (total.saturating_sub(ws) * 42 / 100).max(30);
-    (ws, agents)
+/// Widths of the left tree and the (hidden, reserved for file previews) middle
+/// pane for a terminal `total` cols wide. The tree carries repos *and* their
+/// agents, so it gets ~30%; the chat/detail pane takes everything else.
+pub fn pane_widths(_app: &App, total: u16) -> (u16, u16) {
+    ((total * 30 / 100).clamp(34, 60).min(total / 2), 0)
 }
 
 /// A rounded panel with a dim border and a subtle title.
@@ -141,14 +138,13 @@ fn draw_inner(f: &mut Frame, app: &App) {
     if app.zoom {
         draw_right(f, app, chunks[1]); // [z]: detail/chat takes the full width
     } else {
-        let (ws_w, agents_w) = pane_widths(app, chunks[1].width);
+        let (tree_w, _) = pane_widths(app, chunks[1].width);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(ws_w), Constraint::Length(agents_w), Constraint::Min(20)])
+            .constraints([Constraint::Length(tree_w), Constraint::Min(20)])
             .split(chunks[1]);
-        draw_workspaces(f, app, cols[0]);
-        draw_list(f, app, cols[1]);
-        draw_right(f, app, cols[2]);
+        draw_tree(f, app, cols[0]);
+        draw_right(f, app, cols[1]);
     }
 
     draw_footer(f, app, chunks[2]);
@@ -385,10 +381,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 /// The workspaces pane: pinned folders, the active one highlighted, each with a
 /// live-agent count badge. Focused when `Tab` has moved focus here.
-fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
-    let title = format!(" repos ({}) ", app.workspaces.len());
-    let inner_w = area.width.saturating_sub(2) as usize;
-    let focused = app.focus == Focus::Workspaces && app.mode == Mode::Normal;
+/// Left pane: "all", then each repo with its agents nested beneath it.
+fn draw_tree(f: &mut Frame, app: &App, area: Rect) {
+    let n_agents: usize = app.workspaces.iter().map(|w| w.rows.len()).sum();
+    let title = format!(" repos ({}) · agents ({}) ", app.workspaces.len(), n_agents);
+    let inner_w = area.width.saturating_sub(4) as usize; // borders + highlight symbol
+    let focused = app.mode == Mode::Normal || app.mode == Mode::Filter;
     let block = if focused { panel_focused(&title, ACCENT) } else { panel(&title) };
 
     if app.workspaces.is_empty() {
@@ -399,25 +397,63 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let bold = |on: bool| if on { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
-    let total_live: usize = app.workspaces.iter().map(|w| w.live_count).sum();
+    let cur = app.tree_cursor();
+    let now = now_secs();
+    let green = Style::default().fg(Color::Green);
     let badge = |n: usize| if n > 0 { format!(" ●{n}") } else { String::new() };
-    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
-        Span::styled(if app.view_all { "◆ " } else { "◇ " }, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled("all", bold(app.view_all)),
-        Span::styled(badge(total_live), Style::default().fg(Color::Green)),
-    ]))];
-    items.extend(app.workspaces.iter().enumerate().map(|(i, w)| {
-        let shown = !app.view_all && i == app.active;
-        let glyph = if Some(i) == app.cwd_ws { "› " } else { "  " }; // launched from here
-        let b = badge(w.live_count);
-        let name_w = inner_w.saturating_sub(3 + b.chars().count());
-        ListItem::new(Line::from(vec![
-            Span::styled(glyph, Style::default().fg(Color::DarkGray)),
-            Span::styled(truncate(&w.name(), name_w.max(4)), bold(shown)),
-            Span::styled(b, Style::default().fg(Color::Green)),
-        ]))
-    }));
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut sel = 0;
+    for (pos, it) in app.tree().into_iter().enumerate() {
+        if it == cur {
+            sel = pos;
+        }
+        items.push(match it {
+            TreeItem::All => {
+                let total_live: usize = app.workspaces.iter().map(|w| w.live_count).sum();
+                ListItem::new(Line::from(vec![
+                    Span::styled("◆ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled("all", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(badge(total_live), green),
+                ]))
+            }
+            TreeItem::Repo(i) => {
+                let w = &app.workspaces[i];
+                let b = badge(w.live_count);
+                let launched = if Some(i) == app.cwd_ws { "› " } else { "" };
+                let name_w = inner_w.saturating_sub(2 + launched.len() + b.chars().count());
+                ListItem::new(Line::from(vec![
+                    Span::styled("▾ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(launched, Style::default().fg(Color::DarkGray)),
+                    Span::styled(truncate(&w.name(), name_w.max(4)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(b, green),
+                ]))
+            }
+            TreeItem::Agent(i, j) => {
+                let ws = &app.workspaces[i];
+                let r = &ws.rows[j];
+                let st = r.status_label();
+                let glyph = if st == "running" { spinner() } else { status_icon(st) };
+                let marked = ws.marked.contains(&r.id);
+                let dirt = if ws.dirty.get(&r.id).copied().unwrap_or(false) { "±" } else { " " };
+                let meta = rel_time(r.updated_ts, now).trim_end_matches(" ago").to_string();
+                let cost = if r.cost_usd > 0.0 { format!("${:.2} ", r.cost_usd) } else { String::new() };
+                let tail = cost.len() + meta.len();
+                let shown = if r.display().is_empty() { "(no task)" } else { r.display() };
+                let task_w = inner_w.saturating_sub(2 + 2 + 2 + tail + 1).max(6);
+                let task = truncate(shown, task_w);
+                let pad = inner_w.saturating_sub(2 + 2 + 2 + task.chars().count() + tail);
+                ListItem::new(Line::from(vec![
+                    Span::styled(if marked { "◉ " } else { "  " }, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{glyph} "), Style::default().fg(status_color(st))),
+                    Span::styled(format!("{dirt} "), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::raw(task),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(cost, Style::default().fg(Color::Magenta)),
+                    Span::styled(meta, Style::default().fg(Color::DarkGray)),
+                ]))
+            }
+        });
+    }
 
     let list = List::new(items)
         .block(block)
@@ -428,7 +464,7 @@ fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
         })
         .highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(Some(app.ws_cursor.min(app.workspaces.len())));
+    state.select(Some(sel));
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -452,90 +488,12 @@ fn onboarding(app: &App) -> Vec<Line<'static>> {
     l
 }
 
-fn draw_list(f: &mut Frame, app: &App, area: Rect) {
-    let rows = app.visible_rows();
-    let scope = if app.view_all { "all" } else { "repo" };
-    let title = format!(" agents · {} ({}) ", scope, rows.len());
-    let focused = (app.mode == Mode::Normal || app.mode == Mode::Filter)
-        && app.focus == Focus::Agents;
-    let block = if focused { panel_focused(&title, ACCENT) } else { panel(&title) };
-    if rows.is_empty() {
-        let any = app.workspaces.iter().any(|w| !w.all_rows.is_empty());
-        let lines = if !any {
-            onboarding(app)
-        } else {
-            let what = if app.filter_text.is_empty() { format!("the [{}] filter", app.category.label()) }
-                else { format!("/{}", app.filter_text) };
-            vec![Line::from(""), Line::from(format!("  nothing matches {}", what)),
-                 Line::from(""), Line::from("  [esc] clears it")]
-        };
-        f.render_widget(Paragraph::new(lines).style(Style::default().fg(Color::DarkGray)).block(block), area);
-        return;
-    }
-    let inner_w = area.width.saturating_sub(4) as usize;
-    let now = now_secs();
-    // in the all view each row names its repo instead of the harness color
-    // alone; the harness stays as the colored glyph column
-    // repo (all view, >1 repo) or harness column — dropped when the list is
-    // narrow (the harness still shows as the glyph's color)
-    let tag_w = if inner_w >= 36 { 9 } else { 0 };
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|r| {
-            let ws = &app.workspaces[r.ws];
-            let is_marked = ws.marked.contains(&r.id);
-            let mark = Span::styled(if is_marked { "◉ " } else { "  " },
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
-            let st = r.status_label();
-            // running rows get an animated spinner; everything else a static glyph
-            let glyph = if st == "running" { spinner() } else { status_icon(st) };
-            let icon = Span::styled(format!("{} ", glyph), Style::default().fg(
-                if tag_w == 0 && st == "running" { harness_color(&r.harness) } else { status_color(st) }));
-            let who = if tag_w == 0 {
-                Span::raw("")
-            } else if app.view_all && app.workspaces.len() > 1 {
-                Span::styled(format!("{:<8} ", truncate(&ws.name(), 8)), Style::default().fg(harness_color(&r.harness)))
-            } else {
-                Span::styled(format!("{:<8} ", truncate(&r.harness, 8)), Style::default().fg(harness_color(&r.harness)))
-            };
-            // uncommitted-changes flag (2-col slot keeps rows aligned)
-            let dirt = if ws.dirty.get(&r.id).copied().unwrap_or(false) {
-                Span::styled("± ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-            } else {
-                Span::raw("  ")
-            };
-            let meta = rel_time(r.updated_ts, now).trim_end_matches(" ago").to_string();
-            let cost = if r.cost_usd > 0.0 { format!("${:.2} ", r.cost_usd) } else { String::new() };
-            let tail_len = cost.len() + meta.len();
-            let task_w = inner_w.saturating_sub(2 + 2 + tag_w + 2 + tail_len + 1).max(6);
-            let shown = if r.display().is_empty() { "(no task)" } else { r.display() };
-            // narrow list, several repos: the repo leads the text instead of a column
-            let shown = if tag_w == 0 && app.view_all && app.workspaces.len() > 1 {
-                format!("{} · {}", ws.name(), shown)
-            } else {
-                shown.to_string()
-            };
-            let task = truncate(&shown, task_w);
-            let pad = inner_w.saturating_sub(2 + 2 + tag_w + 2 + task.chars().count() + tail_len);
-            ListItem::new(Line::from(vec![
-                mark, icon, who, dirt, Span::raw(task), Span::raw(" ".repeat(pad)),
-                Span::styled(cost, Style::default().fg(Color::Magenta)),
-                Span::styled(meta, Style::default().fg(Color::DarkGray)),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
-    let mut state = ListState::default();
-    state.select(Some(app.visible_index(&rows)));
-    f.render_stateful_widget(list, area, &mut state);
-}
-
 fn draw_right(f: &mut Frame, app: &App, area: Rect) {
     // live agents, and exited ones whose last screen we still hold
+    if !app.agent_selected() {
+        draw_overview(f, app, area);
+        return;
+    }
     if let Some(idx) = app.selected_row().and_then(|r| r.proc_idx) {
         draw_terminal(f, app, idx, area);
         return;
@@ -615,6 +573,27 @@ fn draw_terminal(f: &mut Frame, app: &App, idx: usize, area: Rect) {
             render_screen(f.buffer_mut(), inner, parser.screen(), focused);
         }
     }
+}
+
+/// Right pane while the cursor is on "all" or a repo (no agent picked).
+fn draw_overview(f: &mut Frame, app: &App, area: Rect) {
+    let block = panel(" crew ");
+    if app.workspaces.iter().all(|w| w.all_rows.is_empty()) {
+        f.render_widget(Paragraph::new(onboarding(app)).block(block), area);
+        return;
+    }
+    let what = match app.tree_cursor() {
+        TreeItem::Repo(i) => format!(" {} ", app.workspaces[i].name()),
+        _ => " all repos ".to_string(),
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(what, Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled("  select an agent to chat or inspect it", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("  [n] launch an agent here · [w] pin another repo", Style::default().fg(ACCENT))),
+    ];
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
@@ -711,9 +690,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Diff => "DIFF — [j/k] line [^d/^u] half [^f/^b] page [g/G] ends [/] search [n/N] next   ·   [q/esc] close",
         Mode::Log => "LOG — [j/k] line [^d/^u] half [g/G] ends (G follows) [/] search [r]eload   ·   [q/esc] close",
         Mode::BrowseFolder => "PIN A REPO — [j/k] move · [l/enter] open · [h/bksp] up · [a] pin · [/] type path · [esc] cancel",
-        Mode::Normal | Mode::Filter if app.focus == Focus::Workspaces => "REPOS — [j/k] move · [l/enter] open (all / one repo) · [w] pin folder · [x] unpin · [?] help",
+        Mode::Normal | Mode::Filter if !app.agent_selected() => "REPO — [j/k] move · [l] first agent · [n]ew agent · [w] pin folder · [x] unpin · [?] help",
         // most-needed first: narrow terminals cut from the right
-        Mode::Normal | Mode::Filter => "[?]help [n]ew [enter]chat/resume [q]uit [j/k]move [h/l]panes [d]iff [P]ush [s]top [x]rm [z]oom",
+        Mode::Normal | Mode::Filter => "[?]help [n]ew [enter]chat/resume [q]uit [j/k]move [h]repo [d]iff [P]ush [s]top [x]rm [z]oom",
         _ => "", // modals carry their own key hints
     };
     f.render_widget(
@@ -1197,7 +1176,7 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("crew"));
         assert!(text.contains("myrepo"));
-        assert!(text.contains("agents ·"));
+        assert!(text.contains("agents ("));
         assert!(text.contains("all"), "all-repos row missing");
         assert!(text.contains("[n]ew"));
     }

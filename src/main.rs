@@ -17,12 +17,12 @@ mod ui;
 mod workspace;
 
 use anyhow::Result;
-use app::{App, Focus, Mode};
+use app::{App, Mode};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyboardEnhancementFlags,
+        KeyModifiers, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -276,15 +276,36 @@ fn snapshot(app: &App) {
     }
 }
 
+static KBD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the terminal to report modified Enter (kitty keyboard protocol), so
+/// Shift+Enter reaches us as Enter+SHIFT instead of a bare Enter. Terminals
+/// without support (Terminal.app) keep the old behaviour; Alt+Enter still works.
+fn push_kbd() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(io::stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        KBD_ENHANCED.store(true, Relaxed);
+    }
+}
+fn pop_kbd() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if KBD_ENHANCED.swap(false, Relaxed) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+}
+
 fn run_tui(app: &mut App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    push_kbd();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = event_loop(app, &mut terminal);
 
+    pop_kbd();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     terminal.show_cursor()?;
@@ -335,46 +356,34 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
                 Event::Mouse(m) if app.mode == Mode::Normal => {
                     let w = terminal.size().map(|s| s.width).unwrap_or(80);
                     // zoomed: the detail pane owns the whole width
-                    let (ws_w, agents_w) = if app.zoom { (0, 0) } else {
-                        let (a, b) = ui::pane_widths(app, w);
-                        (a, a + b)
-                    };
+                    let tree_w = if app.zoom { 0 } else { ui::pane_widths(app, w).0 };
                     match m.kind {
                         MouseEventKind::ScrollDown => {
-                            if m.column < ws_w { app.ws_move(1); }
-                            else if m.column < agents_w { app.move_sel(1); }
+                            if m.column < tree_w { app.tree_move(1); }
                             else { wheel_chat(app, false, m.column, m.row, w); }
                         }
                         MouseEventKind::ScrollUp => {
-                            if m.column < ws_w { app.ws_move(-1); }
-                            else if m.column < agents_w { app.move_sel(-1); }
+                            if m.column < tree_w { app.tree_move(-1); }
                             else { wheel_chat(app, true, m.column, m.row, w); }
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
-                            // items start at y=2 (header row + panel top border);
-                            // ratatui scrolls the list just enough to show the
-                            // selection, so add that offset back.
-                            let h = terminal.size().map(|s| s.height).unwrap_or(24);
-                            let visible = h.saturating_sub(4).max(1) as usize;
-                            if m.column >= agents_w {
-                                // click the terminal pane → chat with that agent
-                                if app.selected_row().map(|r| r.is_live()).unwrap_or(false) {
+                            if m.column >= tree_w {
+                                // click the chat pane → chat with that agent
+                                if app.agent_selected() && app.selected_row().map(|r| r.is_live()).unwrap_or(false) {
                                     app.mode = Mode::Terminal;
                                 }
                             } else if m.row >= 2 {
-                                let row = (m.row - 2) as usize;
-                                if m.column < ws_w {
-                                    let idx = row + app.ws_cursor.saturating_sub(visible - 1);
-                                    if idx <= app.workspaces.len() {
-                                        app.ws_cursor = idx;
-                                        app.focus = Focus::Workspaces;
-                                        app.select_workspace();
-                                    }
-                                } else {
-                                    app.focus = Focus::Agents;
-                                    let rows = app.visible_rows();
-                                    let idx = row + app.visible_index(&rows).saturating_sub(visible - 1);
-                                    app.select_index(idx);
+                                // items start at y=2 (header row + panel top border);
+                                // ratatui scrolls the list just enough to show the
+                                // selection, so add that offset back.
+                                let h = terminal.size().map(|s| s.height).unwrap_or(24);
+                                let visible = h.saturating_sub(4).max(1) as usize;
+                                let tree = app.tree();
+                                let pos = tree.iter().position(|x| *x == app.tree_cursor()).unwrap_or(0);
+                                let idx = (m.row - 2) as usize + pos.saturating_sub(visible - 1);
+                                if let Some(it) = tree.get(idx) {
+                                    app.set_tree(*it);
+                                    let _ = app.active_mut().refresh();
                                 }
                             }
                         }
@@ -427,6 +436,7 @@ fn run_suspended(terminal: &mut Term, cwd: &str, argv: &[String]) -> Result<()> 
     if argv.is_empty() {
         return Ok(());
     }
+    pop_kbd();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     let _ = std::process::Command::new(&argv[0])
@@ -435,6 +445,7 @@ fn run_suspended(terminal: &mut Term, cwd: &str, argv: &[String]) -> Result<()> 
         .status();
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    push_kbd();
     terminal.clear()?;
     Ok(())
 }
@@ -502,7 +513,7 @@ fn scroll_chat(app: &mut App, lines: i64) {
 /// Mouse wheel at screen (col,row) over the chat pane → the agent, translated
 /// to pane-relative cells (pane interior starts below header + border).
 fn wheel_chat(app: &mut App, up: bool, col: u16, row: u16, width: u16) {
-    let x0 = if app.zoom { 1 } else { let (a, b) = ui::pane_widths(app, width); a + b + 1 };
+    let x0 = if app.zoom { 1 } else { ui::pane_widths(app, width).0 + 1 };
     if let Some(p) = app.selected_proc() {
         p.wheel(up, col.saturating_sub(x0), row.saturating_sub(2));
     }
@@ -558,48 +569,36 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let page = app.term_size.1.max(4) as i64;
     match app.mode {
         Mode::Normal => {
-            // Pane focus is vim-style: h/← = workspaces, l/→ = drill in.
-            if app.focus == Focus::Workspaces {
-                if let Some(d) = vim_delta(&key, page) {
-                    match d {
-                        d if d <= i64::MIN / 2 => app.ws_top(),
-                        d if d >= i64::MAX / 2 => app.ws_bottom(),
-                        d => app.ws_move(d.signum()),
-                    }
-                    return;
-                }
-                match code {
-                    KeyCode::Tab | KeyCode::BackTab => { app.toggle_focus(); return; }
-                    KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                        app.select_workspace();
-                        app.focus = Focus::Agents;
-                        return;
-                    }
-                    KeyCode::Char('h') | KeyCode::Left => return,
-                    KeyCode::Char('x') => { app.remove_workspace_at_selected(); return; }
-                    KeyCode::Char('w') => { app.open_browser(); return; }
-                    // anything else is an agent key: hand focus back to the list
-                    // and run it there — never swallow a key silently
-                    _ => app.focus = Focus::Agents,
-                }
-            }
+            // One tree: j/k walk repos and their agents. Agent keys only act on
+            // an agent line, so a repo line can never trigger one by accident.
             if let Some(d) = vim_delta(&key, page) {
                 match d {
-                    d if d <= i64::MIN / 2 => app.sel_top(),
-                    d if d >= i64::MAX / 2 => app.sel_bottom(),
-                    d => app.move_sel(d),
+                    d if d <= i64::MIN / 2 => app.tree_move(i64::MIN / 2),
+                    d if d >= i64::MAX / 2 => app.tree_move(i64::MAX / 2),
+                    d => app.tree_move(d),
                 }
                 return;
             }
+            if !app.agent_selected() {
+                match code {
+                    KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => { app.tree_enter_repo(); return; }
+                    KeyCode::Char('x') => { app.remove_workspace_at_selected(); return; }
+                    KeyCode::Char('q') | KeyCode::Char('w') | KeyCode::Char('n') | KeyCode::Char('a')
+                    | KeyCode::Char('z') | KeyCode::Char('H') | KeyCode::Char('t') | KeyCode::Char(',')
+                    | KeyCode::Char('/') | KeyCode::Char('?') | KeyCode::Char('1') | KeyCode::Char('2')
+                    | KeyCode::Char('3') | KeyCode::Char('4') | KeyCode::Char('S') | KeyCode::Char('A')
+                    | KeyCode::Esc | KeyCode::Char('[') | KeyCode::Char(']') => {}
+                    _ => return, // not an agent line: nothing to act on
+                }
+            }
             match code {
-            KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
-            KeyCode::Char('h') | KeyCode::Left => app.focus = Focus::Workspaces,
+            KeyCode::Char('h') | KeyCode::Left => app.tree_up_to_repo(),
             KeyCode::Char('q') => request_quit(app),
             KeyCode::Char(']') => app.jump_failed(1),
             KeyCode::Char('[') => app.jump_failed(-1),
             KeyCode::Char('y') => app.yank_worktree(),
             KeyCode::Char('w') => app.open_browser(),
-            KeyCode::Char('a') => { app.ws_cursor = 0; app.view_all = true; }
+            KeyCode::Char('a') => app.set_tree(app::TreeItem::All),
             KeyCode::Char('n') => app.open_new_agent(),
             KeyCode::Char('s') => {
                 let has_live = app.marked_total() > 0
@@ -938,6 +937,8 @@ fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
                 c.to_string().into_bytes()
             }
         }
+        // Shift+Enter = newline in the agent's input (same bytes as Alt+Enter)
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => vec![0x1b, b'\r'],
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
@@ -1022,30 +1023,30 @@ mod tests {
         let mut a = app();
         a.all_rows = (0..30).map(|i| mk(&format!("r{i}"))).collect();
         a.apply_filter();
+        handle_key(&mut a, ch('j')); // all -> repo line
+        assert!(!a.agent_selected());
+        handle_key(&mut a, ch('j')); // repo -> its first agent
+        assert!(a.agent_selected());
+        assert_eq!(a.selected, 0);
         handle_key(&mut a, ch('j'));
         assert_eq!(a.selected, 1);
         handle_key(&mut a, ch('G'));
         assert_eq!(a.selected, 29);
         handle_key(&mut a, ch('g'));
-        assert_eq!(a.selected, 0);
+        assert!(!a.agent_selected(), "g = top of the tree");
+        handle_key(&mut a, ch('j'));
+        handle_key(&mut a, ch('l'));
+        assert_eq!(a.selected, 0, "l on a repo steps into its agents");
         handle_key(&mut a, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(a.selected > 1, "ctrl-d half-pages");
-        // h focuses workspaces; j/k there don't move the agent list; l comes back
+        // h climbs to the repo line; agent keys never act there
         handle_key(&mut a, ch('h'));
-        assert_eq!(a.focus, Focus::Workspaces);
-        let sel = a.selected;
-        handle_key(&mut a, ch('j'));
-        assert_eq!(a.selected, sel);
-        handle_key(&mut a, ch('l'));
-        assert_eq!(a.focus, Focus::Agents);
-        // an agent key pressed while the repos pane has focus is never
-        // swallowed: focus returns to the list and the key runs there
-        handle_key(&mut a, ch('h'));
+        assert!(!a.agent_selected());
         handle_key(&mut a, ch('x'));
-        assert_eq!(a.mode, Mode::Normal, "x in the repos pane = unpin (refused: last repo)");
+        assert_eq!(a.mode, Mode::Normal, "x on a repo = unpin (refused: last repo)");
         handle_key(&mut a, ch('d'));
-        assert_eq!(a.focus, Focus::Agents, "agent key hands focus back");
-        a.mode = Mode::Normal;
+        assert_eq!(a.mode, Mode::Normal, "agent key ignored on a repo line");
+        handle_key(&mut a, ch('l'));
         // x always confirms
         handle_key(&mut a, ch('x'));
         assert_eq!(a.mode, Mode::ConfirmRemove);
@@ -1105,6 +1106,13 @@ mod tests {
     fn alt_key_sends_esc_prefix() {
         let b = key_to_bytes(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
         assert_eq!(b, b"\x1bb");
+    }
+
+    #[test]
+    fn shift_enter_sends_newline_sequence() {
+        let k = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(key_to_bytes(k), vec![0x1b, b'\r']);
+        assert_eq!(key_to_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())), vec![b'\r']);
     }
 
     #[test]
