@@ -2,7 +2,7 @@
 //! selected agent's *embedded terminal* (interactive) or a preview (observed).
 
 use crate::agent::{rel_time, Kind};
-use crate::app::{App, Mode};
+use crate::app::{App, Focus, Mode};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -13,13 +13,22 @@ use ratatui::{
     },
     Frame,
 };
-use tui_term::widget::PseudoTerminal;
 
 // ── theme ────────────────────────────────────────────────────────────────
 // One accent so the UI reads as a system (lazygit/k9s style). Borders are
 // rounded and dim until a panel is focused, then they light up in the accent.
 const ACCENT: Color = Color::Cyan;
 const ACCENT_DIM: Color = Color::DarkGray;
+
+/// Widths of the workspaces and agents panes for a terminal `total` cols wide.
+/// The workspaces pane is sized to its names (it's a short list); the agents
+/// list — the main navigator — gets ~42% of the rest; the detail pane the remainder.
+pub fn pane_widths(app: &App, total: u16) -> (u16, u16) {
+    let longest = app.workspaces.iter().map(|w| w.name().chars().count()).max().unwrap_or(4) as u16;
+    let ws = (longest + 11).clamp(16, 28).min(total / 4);
+    let agents = (total.saturating_sub(ws) * 42 / 100).max(30);
+    (ws, agents)
+}
 
 /// A rounded panel with a dim border and a subtle title.
 fn panel(title: &str) -> Block<'static> {
@@ -57,8 +66,8 @@ fn spinner() -> &'static str {
 
 /// Render a vertical scrollbar on the right edge of `area` for a scrolled view.
 fn scrollbar(f: &mut Frame, area: Rect, pos: u16, total: usize) {
-    if total == 0 {
-        return;
+    if total <= area.height.saturating_sub(2) as usize {
+        return; // everything fits — no scrollbar
     }
     let mut state = ScrollbarState::new(total).position(pos as usize);
     f.render_stateful_widget(
@@ -72,6 +81,7 @@ fn scrollbar(f: &mut Frame, area: Rect, pos: u16, total: usize) {
 
 fn status_color(status: &str) -> Color {
     match status {
+        "waiting" => Color::Yellow,
         "running" => Color::Green,
         "done" => Color::Green,
         "failed" => Color::Red,
@@ -105,6 +115,7 @@ fn meter(pct: f64, width: usize) -> String {
 
 fn status_icon(status: &str) -> &'static str {
     match status {
+        "waiting" => "⏸",
         "running" => "●",
         "done" => "✓",
         "failed" => "✗",
@@ -122,17 +133,24 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, chunks[0]);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-        .split(chunks[1]);
-    draw_list(f, app, cols[0]);
-    draw_right(f, app, cols[1]);
+    if app.zoom {
+        draw_right(f, app, chunks[1]); // [z]: detail/chat takes the full width
+    } else {
+        let (ws_w, agents_w) = pane_widths(app, chunks[1].width);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(ws_w), Constraint::Length(agents_w), Constraint::Min(20)])
+            .split(chunks[1]);
+        draw_workspaces(f, app, cols[0]);
+        draw_list(f, app, cols[1]);
+        draw_right(f, app, cols[2]);
+    }
 
     draw_footer(f, app, chunks[2]);
 
     match app.mode {
         Mode::NewAgent => draw_form(f, app),
+        Mode::BrowseFolder => draw_browser(f, app),
         Mode::Help => draw_help(f, app),
         Mode::Diff => draw_diff(f, app),
         Mode::Log => draw_log(f, app),
@@ -144,6 +162,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::ConfirmPush => draw_confirm_push(f, app),
         Mode::Settings => draw_settings(f, app),
         Mode::ConfirmRemove => draw_confirm_remove(f, app),
+        Mode::ConfirmClear => draw_confirm_clear(f, app),
         Mode::Rename => draw_rename(f, app),
         _ => {}
     }
@@ -152,15 +171,36 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn draw_confirm_remove(f: &mut Frame, app: &App) {
     let area = centered(52, 20, f.area());
     f.render_widget(Clear, area);
+    let what = if app.marked_total() == 0 {
+        format!("'{}'", truncate(app.selected_row().map(|r| r.display()).unwrap_or(""), 30))
+    } else {
+        format!("{} marked agent(s)", app.marked_total())
+    };
     let lines = vec![
         Line::from(""),
-        Line::from(Span::raw(format!("  Remove {} marked agent(s)?", app.marked.len()))),
-        Line::from(Span::styled("  (worktrees stay on disk)", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::raw(format!("  Remove {}?", what))),
+        Line::from(Span::styled("  kills it if live, forgets it (no resume);", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("  clean crew worktrees are pruned, dirty ones kept", Style::default().fg(Color::DarkGray))),
         Line::from(""),
         Line::from(Span::styled("  [y] remove   [n/esc] cancel", Style::default().fg(Color::DarkGray))),
     ];
     f.render_widget(Paragraph::new(lines)
         .block(dialog(Span::styled(" confirm remove ", Style::default().fg(Color::Red)))), area);
+}
+
+fn draw_confirm_clear(f: &mut Frame, app: &App) {
+    let area = centered(56, 20, f.area());
+    f.render_widget(Clear, area);
+    let n = app.visible_rows().iter().filter(|r| r.resumable || r.status == "exited").count();
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::raw(format!("  Forget {} finished agent(s)?", n))),
+        Line::from(Span::styled("  they will no longer be resumable (worktrees kept)", Style::default().fg(Color::DarkGray))),
+        Line::from(""),
+        Line::from(Span::styled("  [y] clear   [n/esc] cancel", Style::default().fg(Color::DarkGray))),
+    ];
+    f.render_widget(Paragraph::new(lines)
+        .block(dialog(Span::styled(" confirm clear ", Style::default().fg(Color::Red)))), area);
 }
 
 fn draw_rename(f: &mut Frame, app: &App) {
@@ -209,6 +249,11 @@ fn draw_settings(f: &mut Frame, app: &App) {
         row(1, "model", model),
         row(2, "workflow", workflow),
         row(3, "worktree", wt),
+        row(4, "backend", &format!("{}  (all repos)", match app.settings_backend.as_str() {
+            "tmux" => "tmux — agents survive quitting crew",
+            "pty" => "pty — agents stop when crew exits",
+            _ => "auto — tmux if installed, else pty",
+        })),
         Line::from(""),
         Line::from(Span::styled("  [tab] field   [←→] change   [enter] save   [esc] cancel",
             Style::default().fg(Color::DarkGray))),
@@ -220,7 +265,7 @@ fn draw_confirm_push(f: &mut Frame, app: &App) {
     let area = centered(64, 34, f.area());
     f.render_widget(Clear, area);
     let has_gh = crate::app::gh_available();
-    let n = app.push_queue.len();
+    let n = app.push_total();
     let target = if n == 1 {
         Line::from(vec![Span::styled("  push branch  ", Style::default().fg(Color::DarkGray)),
             Span::styled(app.push_queue.first().map(|q| q.1.clone()).unwrap_or_default(),
@@ -271,35 +316,35 @@ fn draw_retry(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let repo = app
-        .store
-        .repo_root
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "?".into());
     let mode = match app.mode {
         Mode::Terminal => " CHAT ",
         _ => "",
     };
     // per-status tallies + total metered cost across every visible row
-    let count = |s: &str| app.rows.iter().filter(|r| r.status == s).count();
-    let (running, done, failed) = (count("running"), count("done"), count("failed"));
-    let total_cost: f64 = app.rows.iter().map(|r| r.cost_usd).sum();
+    let rows = app.visible_rows();
+    let count = |s: &str| rows.iter().filter(|r| r.status_label() == s).count();
+    let (waiting, running, done, failed) = (count("waiting"), count("running"), count("done"), count("failed"));
+    let total_cost: f64 = rows.iter().map(|r| r.cost_usd).sum();
 
     let mut spans = vec![
         Span::styled(" crew ", Style::default().bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::raw(format!(" {} ", repo)),
     ];
-    if !app.repo_branch.is_empty() {
-        spans.push(Span::styled(format!(" {} ", app.repo_branch), Style::default().fg(Color::Yellow)));
+    if app.view_all {
+        let n = app.workspaces.len();
+        spans.push(Span::raw(format!(" all · {} repo{} ", n, if n == 1 { "" } else { "s" })));
+    } else {
+        spans.push(Span::raw(format!(" {} ", app.name())));
+        if !app.repo_branch.is_empty() {
+            spans.push(Span::styled(format!(" {} ", app.repo_branch), Style::default().fg(Color::Yellow)));
+        }
+        if app.store.has_engine() {
+            spans.push(Span::styled("⚙ engine ", Style::default().fg(Color::Green)));
+        }
     }
-    // standalone vs. engine-connected
-    if app.store.has_engine() {
-        spans.push(Span::styled("⚙ engine ", Style::default().fg(Color::Green)));
-    }
-    spans.push(Span::styled(format!("· {} agents  ", app.rows.len()), Style::default().fg(Color::Gray)));
+    let n = rows.len();
+    spans.push(Span::styled(format!("· {} agent{}  ", n, if n == 1 { "" } else { "s" }), Style::default().fg(Color::Gray)));
     // colored status legend, only showing non-zero buckets
-    let legend = [(running, "●", Color::Green), (done, "✓", Color::Green), (failed, "✗", Color::Red)];
+    let legend = [(waiting, "⏸", Color::Yellow), (running, "●", Color::Green), (done, "✓", Color::Green), (failed, "✗", Color::Red)];
     for (n, glyph, color) in legend {
         if n > 0 {
             spans.push(Span::styled(format!("{}{} ", glyph, n), Style::default().fg(color)));
@@ -309,8 +354,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(format!(" ${:.3} ", total_cost),
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
     }
-    if !app.marked.is_empty() {
-        spans.push(Span::styled(format!(" ◉ {} marked ", app.marked.len()),
+    if app.marked_total() > 0 {
+        spans.push(Span::styled(format!(" ◉ {} marked ", app.marked_total()),
             Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD)));
     }
     // active category / non-default sort chips (k9s-style)
@@ -332,51 +377,140 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_list(f: &mut Frame, app: &App, area: Rect) {
-    let title = format!(" agents ({}) ", app.rows.len());
-    if app.rows.is_empty() {
-        // distinguish "nothing at all" from "your filter hid everything"
-        let msg = if app.all_rows.is_empty() {
-            "\n  no agents yet.\n\n  press [n] to launch one.".to_string()
+/// The workspaces pane: pinned folders, the active one highlighted, each with a
+/// live-agent count badge. Focused when `Tab` has moved focus here.
+fn draw_workspaces(f: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" repos ({}) ", app.workspaces.len());
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let focused = app.focus == Focus::Workspaces && app.mode == Mode::Normal;
+    let block = if focused { panel_focused(&title, ACCENT) } else { panel(&title) };
+
+    if app.workspaces.is_empty() {
+        f.render_widget(
+            Paragraph::new("\n  no workspaces.\n\n  press [w] to pin one.").style(Style::default().fg(Color::DarkGray)).block(block),
+            area,
+        );
+        return;
+    }
+
+    let bold = |on: bool| if on { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) };
+    let total_live: usize = app.workspaces.iter().map(|w| w.live_count).sum();
+    let badge = |n: usize| if n > 0 { format!(" ●{n}") } else { String::new() };
+    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
+        Span::styled(if app.view_all { "◆ " } else { "◇ " }, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("all", bold(app.view_all)),
+        Span::styled(badge(total_live), Style::default().fg(Color::Green)),
+    ]))];
+    items.extend(app.workspaces.iter().enumerate().map(|(i, w)| {
+        let shown = !app.view_all && i == app.active;
+        let glyph = if Some(i) == app.cwd_ws { "› " } else { "  " }; // launched from here
+        let b = badge(w.live_count);
+        let name_w = inner_w.saturating_sub(3 + b.chars().count());
+        ListItem::new(Line::from(vec![
+            Span::styled(glyph, Style::default().fg(Color::DarkGray)),
+            Span::styled(truncate(&w.name(), name_w.max(4)), bold(shown)),
+            Span::styled(b, Style::default().fg(Color::Green)),
+        ]))
+    }));
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(if focused {
+            Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD)
         } else {
-            format!("\n  nothing matches the [{}] filter.\n\n  press [1] for all, or [/] to search.",
-                app.category.label())
+            Style::default().add_modifier(Modifier::REVERSED)
+        })
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    state.select(Some(app.ws_cursor.min(app.workspaces.len())));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Empty-state onboarding: what crew found (git, harness CLIs) + next step.
+fn onboarding(app: &App) -> Vec<Line<'static>> {
+    let ok = |b: bool| if b { Span::styled("✓ ", Style::default().fg(Color::Green)) } else { Span::styled("✗ ", Style::default().fg(Color::Red)) };
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut l = vec![Line::from(""), Line::from(Span::styled("  no agents yet", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))), Line::from("")];
+    if !app.view_all {
+        l.push(Line::from(vec![Span::raw("  "), ok(app.is_git),
+            Span::styled(if app.is_git { "git repo · own worktree per agent" } else { "plain folder · agents share it" }, dim)]));
+    }
+    for h in crate::app::HARNESSES {
+        l.push(Line::from(vec![Span::raw("  "), ok(crate::app::harness_installed(h)),
+            Span::styled(format!("{} ({})", h, crate::app::harness_bin(h)), dim)]));
+    }
+    l.push(Line::from(""));
+    l.push(Line::from(Span::styled("  [n] launch an agent", Style::default().fg(ACCENT))));
+    l.push(Line::from(Span::styled("  [w] pin another repo", dim)));
+    l.push(Line::from(Span::styled("  [?] all keys", dim)));
+    l
+}
+
+fn draw_list(f: &mut Frame, app: &App, area: Rect) {
+    let rows = app.visible_rows();
+    let scope = if app.view_all { "all" } else { "repo" };
+    let title = format!(" agents · {} ({}) ", scope, rows.len());
+    let focused = (app.mode == Mode::Normal || app.mode == Mode::Filter)
+        && app.focus == Focus::Agents;
+    let block = if focused { panel_focused(&title, ACCENT) } else { panel(&title) };
+    if rows.is_empty() {
+        let any = app.workspaces.iter().any(|w| !w.all_rows.is_empty());
+        let lines = if !any {
+            onboarding(app)
+        } else {
+            let what = if app.filter_text.is_empty() { format!("the [{}] filter", app.category.label()) }
+                else { format!("/{}", app.filter_text) };
+            vec![Line::from(""), Line::from(format!("  nothing matches {}", what)),
+                 Line::from(""), Line::from("  [esc] clears it")]
         };
-        let hint = Paragraph::new(msg)
-            .style(Style::default().fg(Color::DarkGray))
-            .block(panel(&title));
-        f.render_widget(hint, area);
+        f.render_widget(Paragraph::new(lines).style(Style::default().fg(Color::DarkGray)).block(block), area);
         return;
     }
     let inner_w = area.width.saturating_sub(4) as usize;
     let now = now_secs();
-    let items: Vec<ListItem> = app
-        .rows
+    // in the all view each row names its repo instead of the harness color
+    // alone; the harness stays as the colored glyph column
+    // repo (all view, >1 repo) or harness column — dropped when the list is
+    // narrow (the harness still shows as the glyph's color)
+    let tag_w = if inner_w >= 36 { 9 } else { 0 };
+    let items: Vec<ListItem> = rows
         .iter()
         .map(|r| {
-            let is_marked = app.marked.contains(&r.id);
+            let ws = &app.workspaces[r.ws];
+            let is_marked = ws.marked.contains(&r.id);
             let mark = Span::styled(if is_marked { "◉ " } else { "  " },
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+            let st = r.status_label();
             // running rows get an animated spinner; everything else a static glyph
-            let glyph = if r.status == "running" { spinner() } else { status_icon(&r.status) };
-            let icon = Span::styled(format!("{} ", glyph),
-                Style::default().fg(status_color(&r.status)));
-            let who = Span::styled(format!("{:<8} ", truncate(&r.harness, 8)),
-                Style::default().fg(harness_color(&r.harness)));
+            let glyph = if st == "running" { spinner() } else { status_icon(st) };
+            let icon = Span::styled(format!("{} ", glyph), Style::default().fg(
+                if tag_w == 0 && st == "running" { harness_color(&r.harness) } else { status_color(st) }));
+            let who = if tag_w == 0 {
+                Span::raw("")
+            } else if app.view_all && app.workspaces.len() > 1 {
+                Span::styled(format!("{:<8} ", truncate(&ws.name(), 8)), Style::default().fg(harness_color(&r.harness)))
+            } else {
+                Span::styled(format!("{:<8} ", truncate(&r.harness, 8)), Style::default().fg(harness_color(&r.harness)))
+            };
             // uncommitted-changes flag (2-col slot keeps rows aligned)
-            let dirt = if app.dirty.get(&r.id).copied().unwrap_or(false) {
+            let dirt = if ws.dirty.get(&r.id).copied().unwrap_or(false) {
                 Span::styled("± ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             } else {
                 Span::raw("  ")
             };
-            let meta = rel_time(r.updated_ts, now);
+            let meta = rel_time(r.updated_ts, now).trim_end_matches(" ago").to_string();
             let cost = if r.cost_usd > 0.0 { format!("${:.2} ", r.cost_usd) } else { String::new() };
-            // tail: [cost]+time. Left cols: mark(2)+icon(2)+who(9)+dirt(2).
             let tail_len = cost.len() + meta.len();
-            let task_w = inner_w.saturating_sub(2 + 2 + 9 + 2 + tail_len + 1).max(6);
-            let shown = r.display();
-            let task = truncate(if shown.is_empty() { "(no task)" } else { shown }, task_w);
-            let pad = inner_w.saturating_sub(2 + 2 + 9 + 2 + task.chars().count() + tail_len);
+            let task_w = inner_w.saturating_sub(2 + 2 + tag_w + 2 + tail_len + 1).max(6);
+            let shown = if r.display().is_empty() { "(no task)" } else { r.display() };
+            // narrow list, several repos: the repo leads the text instead of a column
+            let shown = if tag_w == 0 && app.view_all && app.workspaces.len() > 1 {
+                format!("{} · {}", ws.name(), shown)
+            } else {
+                shown.to_string()
+            };
+            let task = truncate(&shown, task_w);
+            let pad = inner_w.saturating_sub(2 + 2 + tag_w + 2 + task.chars().count() + tail_len);
             ListItem::new(Line::from(vec![
                 mark, icon, who, dirt, Span::raw(task), Span::raw(" ".repeat(pad)),
                 Span::styled(cost, Style::default().fg(Color::Magenta)),
@@ -385,37 +519,80 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let focused = app.mode == Mode::Normal || app.mode == Mode::Filter;
-    let block = if focused { panel_focused(&title, ACCENT) } else { panel(&title) };
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(Some(app.selected.min(app.rows.len() - 1)));
+    state.select(Some(app.visible_index(&rows)));
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_right(f: &mut Frame, app: &App, area: Rect) {
-    match app.selected_row() {
-        Some(r) if r.interactive => {
-            if let Some(idx) = r.proc_idx {
-                draw_terminal(f, app, idx, area);
-                return;
-            }
-        }
-        _ => {}
+    // live agents, and exited ones whose last screen we still hold
+    if let Some(idx) = app.selected_row().and_then(|r| r.proc_idx) {
+        draw_terminal(f, app, idx, area);
+        return;
     }
     draw_preview(f, app, area);
+}
+
+fn vt_color(c: vt100::Color) -> Color {
+    match c {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Paint a vt100 screen into `area` cell by cell (colors, bold/italic/
+/// underline/inverse, wide chars), plus a block cursor when focused and at the
+/// live bottom.
+fn render_screen(buf: &mut ratatui::buffer::Buffer, area: Rect, screen: &vt100::Screen, cursor: bool) {
+    for row in 0..area.height {
+        for col in 0..area.width {
+            let Some(c) = screen.cell(row, col) else { continue };
+            if c.is_wide_continuation() {
+                continue; // the wide char to the left covers this cell
+            }
+            let mut st = Style::default().fg(vt_color(c.fgcolor())).bg(vt_color(c.bgcolor()));
+            if c.bold() { st = st.add_modifier(Modifier::BOLD); }
+            if c.italic() { st = st.add_modifier(Modifier::ITALIC); }
+            if c.underline() { st = st.add_modifier(Modifier::UNDERLINED); }
+            if c.inverse() { st = st.add_modifier(Modifier::REVERSED); }
+            let cell = &mut buf[(area.x + col, area.y + row)];
+            let sym = c.contents();
+            cell.set_symbol(if c.has_contents() { &sym } else { " " });
+            cell.set_style(st);
+        }
+    }
+    let (r, c) = screen.cursor_position();
+    if cursor && !screen.hide_cursor() && screen.scrollback() == 0 && r < area.height && c < area.width {
+        let cell = &mut buf[(area.x + c, area.y + r)];
+        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+    }
 }
 
 /// The embedded terminal — the agent's live REPL, rendered inside the TUI.
 fn draw_terminal(f: &mut Frame, app: &App, idx: usize, area: Rect) {
     let focused = app.mode == Mode::Terminal;
+    let live = app.selected_row().map(|r| r.is_live()).unwrap_or(false);
+    let zoom = if app.zoom { "[z] unzoom" } else { "[z] zoom" };
     let title = if focused {
-        " chat · typing goes to the agent · [Ctrl-o] leave ".to_string()
+        " chat · typing goes to the agent · [Ctrl-q] leave ".to_string()
+    } else if live {
+        format!(" terminal · [enter/l] chat · {} ", zoom)
     } else {
-        " terminal · [enter] to chat ".to_string()
+        format!(" exited · last screen · [enter/l] resume · {} ", zoom)
+    };
+    // scrolled into history? say so, and how to get back
+    let back = app.agents.get(idx)
+        .and_then(|p| p.parser.lock().ok().map(|p| p.screen().scrollback()))
+        .unwrap_or(0);
+    let title = if back > 0 {
+        format!(" ↑ {} lines back · wheel / Shift-PgDn / type to return ", back)
+    } else {
+        title
     };
     let block = if focused {
         panel_focused(&title, Color::Green)
@@ -429,8 +606,7 @@ fn draw_terminal(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         // keep the PTY sized to the visible pane
         proc.resize(inner.height.max(1), inner.width.max(1));
         if let Ok(parser) = proc.parser.lock() {
-            let term = PseudoTerminal::new(parser.screen());
-            f.render_widget(term, inner);
+            render_screen(f.buffer_mut(), inner, parser.screen(), focused);
         }
     }
 }
@@ -445,16 +621,17 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
     };
     let inner_w = block.inner(area).width as usize;
     let field = |k: &str| Span::styled(format!("{:<9}", k), Style::default().fg(Color::DarkGray));
-    let kind = match r.kind { Kind::Managed => "agent", Kind::Observed => "observed session" };
-    let glyph = if r.status == "running" { spinner() } else { status_icon(&r.status) };
+    let st = r.status_label();
+    let glyph = if st == "running" { spinner() } else { status_icon(st) };
     let mut lines = vec![
         Line::from(Span::styled(
             truncate(if r.display().is_empty() { "(no task)" } else { r.display() }, inner_w.saturating_sub(1)),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
         Line::from(""),
         Line::from(vec![field("status"), Span::styled(
-            format!("{} {}", glyph, r.status), Style::default().fg(status_color(&r.status)))]),
-        Line::from(vec![field("kind"), Span::raw(kind.to_string())]),
+            format!("{} {}", glyph, if r.waiting { "waiting for input" } else { st }),
+            Style::default().fg(status_color(st)))]),
+        Line::from(vec![field("repo"), Span::raw(app.name())]),
         Line::from(vec![field("harness"),
             Span::styled(r.harness.clone(), Style::default().fg(harness_color(&r.harness))),
             Span::styled(format!(" · {}", r.model), Style::default().fg(Color::Gray))]),
@@ -484,8 +661,10 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("#{} open  [O] open", n),
                 Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))]));
     }
-    lines.push(Line::from(vec![field("cost"),
-        Span::styled(format!("${:.3}", r.cost_usd), Style::default().fg(Color::Magenta))]));
+    if r.cost_usd > 0.0 {
+        lines.push(Line::from(vec![field("cost"),
+            Span::styled(format!("${:.3}", r.cost_usd), Style::default().fg(Color::Magenta))]));
+    }
     if let Some(p) = r.ctx_pct {
         // btop-style meter; reddens as context fills up
         let color = if p >= 85.0 { Color::Red } else if p >= 60.0 { Color::Yellow } else { Color::Green };
@@ -510,21 +689,26 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![field("worktree"),
             Span::styled(truncate(wt, inner_w.saturating_sub(10)), Style::default().fg(Color::DarkGray))]));
     }
-    if r.kind == Kind::Managed && !r.interactive {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "[d]iff [l]og [e]dit [!]shell [P]ush [R]etry [o]wt [x]rm",
-            Style::default().fg(ACCENT_DIM))));
-    }
+    lines.push(Line::from(""));
+    let hint = match r.kind {
+        Kind::Observed => "[enter] take over this claude session as an agent",
+        _ if r.resumable => "[enter] resume · [d]iff [e]dit [!]shell [P]ush [x]rm",
+        _ => "[enter] log · [d]iff [L]og [e]dit [!]shell [P]ush [R]etry [x]rm",
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(ACCENT_DIM))));
     f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let keys = match app.mode {
-        Mode::Terminal => "CHAT — type to talk   ·   [shift-tab] cycle agent modes   ·   [Ctrl-o] back",
-        Mode::Diff => "DIFF — [j/k]scroll [space/pgdn]page   ·   [q/esc] close",
-        Mode::Log => "LOG — [j/k]scroll [space/pgdn]page [r]eload   ·   [q/esc] close",
-        _ => "[q]uit [jk]move [n]ew [enter]chat [d]iff [l]og [e]dit [P]ush [s]top [x]rm [1-4]filter [,]settings [?]help",
+        Mode::Terminal => "CHAT — [Ctrl-q] back to list · [wheel / Shift-PgUp] history · [Shift-drag] select text · [shift-tab] agent modes",
+        Mode::Diff => "DIFF — [j/k] line [^d/^u] half [^f/^b] page [g/G] ends [/] search [n/N] next   ·   [q/esc] close",
+        Mode::Log => "LOG — [j/k] line [^d/^u] half [g/G] ends (G follows) [/] search [r]eload   ·   [q/esc] close",
+        Mode::BrowseFolder => "PIN A REPO — [j/k] move · [l/enter] open · [h/bksp] up · [a] pin · [/] type path · [esc] cancel",
+        Mode::Normal | Mode::Filter if app.focus == Focus::Workspaces => "REPOS — [j/k] move · [l/enter] open (all / one repo) · [w] pin folder · [x] unpin · [?] help",
+        // most-needed first: narrow terminals cut from the right
+        Mode::Normal | Mode::Filter => "[?]help [n]ew [enter]chat/resume [q]uit [j/k]move [h/l]panes [d]iff [P]ush [s]top [x]rm [z]oom",
+        _ => "", // modals carry their own key hints
     };
     f.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -536,145 +720,175 @@ fn draw_form(f: &mut Frame, app: &App) {
     let area = centered(76, 66, f.area());
     f.render_widget(Clear, area);
     let form = &app.new_form;
-    use crate::app::{FIELD_HARNESS, FIELD_IMAGES, FIELD_MODEL, FIELD_TASK, FIELD_WORKFLOW, FIELD_WORKTREE};
+    use crate::app::{FIELD_HARNESS, FIELD_IMAGES, FIELD_MODEL, FIELD_REPO, FIELD_TASK, FIELD_WORKFLOW, FIELD_WORKTREE};
+    let engine = app.store.has_engine();
+    // progressive disclosure: advanced options fold into one line until focused
+    let open = form.field >= FIELD_WORKFLOW;
 
     let block = panel_focused(" new agent ", ACCENT);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let adv_h = if open { 4 } else { 1 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
-            Constraint::Length(1), // label: task
-            Constraint::Length(5), // task editor
-            Constraint::Length(1), // workflow
-            Constraint::Length(1), // harness
-            Constraint::Length(1), // model
-            Constraint::Length(1), // worktree
-            Constraint::Length(1), // images
-            Constraint::Min(1),    // hints / error
+            Constraint::Length(1),     // label: task
+            Constraint::Length(6),     // task editor
+            Constraint::Length(1),     // repo
+            Constraint::Length(1),     // harness
+            Constraint::Length(adv_h), // advanced (summary or 4 pickers)
+            Constraint::Length(1),     // images
+            Constraint::Length(1),     // where it runs
+            Constraint::Min(1),        // hints / error
         ])
         .split(inner);
 
     let lbl = |i: usize, t: &str| {
         let active = form.field == i;
         Span::styled(
-            format!("{}{}", if active { "▶ " } else { "  " }, t),
+            format!("{}{:<10}", if active { "▶ " } else { "  " }, t),
             if active { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) }
             else { Style::default().fg(Color::Gray) },
         )
     };
-    let picker = |active: bool, value: &str, idx: usize, total: usize| {
-        let arrow = if active { Color::Cyan } else { Color::DarkGray };
-        Line::from(vec![
-            Span::styled("   ‹ ", Style::default().fg(arrow)),
-            Span::styled(value.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(" ›", Style::default().fg(arrow)),
-            Span::styled(format!("  {}/{}", idx + 1, total), Style::default().fg(Color::DarkGray)),
-        ])
+    let picker = |i: usize, value: &str, note: Span<'static>| {
+        let arrow = if form.field == i { Color::Cyan } else { Color::DarkGray };
+        let mut v = Vec::new();
+        v.push(Span::styled("‹ ", Style::default().fg(arrow)));
+        v.push(Span::styled(value.to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+        v.push(Span::styled(" ›", Style::default().fg(arrow)));
+        v.push(note);
+        v
     };
+    let line = |i: usize, label: &str, value: &str, note: Span<'static>| {
+        let mut v = vec![lbl(i, label)];
+        v.extend(picker(i, value, note));
+        Line::from(v)
+    };
+    let dim = |t: String| Span::styled(t, Style::default().fg(Color::DarkGray));
 
-    f.render_widget(Paragraph::new(Span::styled("  Launch an interactive agent",
-        Style::default().add_modifier(Modifier::BOLD))), rows[0]);
-    f.render_widget(Paragraph::new(Line::from(lbl(FIELD_TASK, "task *  (Enter = newline)"))), rows[1]);
-
-    // the multiline rich task editor
+    f.render_widget(Paragraph::new(Line::from(lbl(FIELD_TASK, "task *"))), rows[0]);
     let mut task = form.task.clone();
     let te_border = if form.field == FIELD_TASK { Color::Cyan } else { Color::DarkGray };
     task.set_block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(te_border)));
-    f.render_widget(&task, rows[2]);
+    f.render_widget(&task, rows[1]);
 
-    let mut fline = vec![lbl(FIELD_WORKFLOW, "workflow")];
-    fline.extend(picker(form.field == FIELD_WORKFLOW, form.workflow(),
-        form.workflow_idx, crate::app::WORKFLOWS.len()).spans);
-    f.render_widget(Paragraph::new(Line::from(fline)), rows[3]);
+    let repo_note = dim(format!("  {}/{}{}", form.ws_idx + 1, app.workspaces.len(),
+        if Some(form.ws_idx) == app.cwd_ws { " · launched here" } else { "" }));
+    f.render_widget(Paragraph::new(line(FIELD_REPO, "repo", &app.name(), repo_note)), rows[2]);
 
-    let presets = crate::app::model_presets(form.harness_idx);
-    let mut hline = vec![lbl(FIELD_HARNESS, "harness")];
-    hline.extend(picker(form.field == FIELD_HARNESS, form.harness(), form.harness_idx, 3).spans);
-    // is this harness's CLI installed?
-    if crate::app::harness_installed(form.harness()) {
-        hline.push(Span::styled("  ✓ installed", Style::default().fg(Color::Green)));
+    let inst = if crate::app::harness_installed(form.harness()) {
+        Span::styled("  ✓ installed", Style::default().fg(Color::Green))
     } else {
-        hline.push(Span::styled(format!("  ✗ '{}' not on PATH", crate::app::harness_bin(form.harness())),
-            Style::default().fg(Color::Red)));
+        Span::styled(format!("  ✗ '{}' not on PATH", crate::app::harness_bin(form.harness())), Style::default().fg(Color::Red))
+    };
+    let inst = if form.harness() == "claude" && !form.claude_trusted && crate::app::harness_installed("claude") {
+        Span::styled("  ⚠ untrusted: claude asks, pick Yes", Style::default().fg(Color::Yellow))
+    } else {
+        inst
+    };
+    f.render_widget(Paragraph::new(line(FIELD_HARNESS, "harness", form.harness(), inst)), rows[3]);
+
+    let wt = if !app.is_git { "this folder (not a git repo)" }
+        else if form.worktree_new { "new git worktree (isolated)" } else { "this repo checkout (shared)" };
+    if open {
+        let adv = Layout::default().direction(Direction::Vertical)
+            .constraints([Constraint::Length(1); 4]).split(rows[4]);
+        // workflow picker only exists with the engine (its skills run plan/build)
+        let mut slot = adv.iter();
+        if engine {
+            f.render_widget(Paragraph::new(line(FIELD_WORKFLOW, "workflow", form.workflow(), dim(String::new()))), *slot.next().unwrap());
+        }
+        f.render_widget(Paragraph::new(line(FIELD_MODEL, "model", form.model(), dim(String::new()))), *slot.next().unwrap());
+        f.render_widget(Paragraph::new(line(FIELD_WORKTREE, "runs in", wt, dim(String::new()))), *slot.next().unwrap());
+    } else {
+        let wf = if engine && form.workflow_idx != 0 { format!("{} · ", form.workflow()) } else { String::new() };
+        f.render_widget(Paragraph::new(Line::from(vec![
+            Span::styled("  options   ", Style::default().fg(Color::Gray)),
+            dim(format!("{}{} · {}  [tab]", wf, form.model(), wt)),
+        ])), rows[4]);
     }
-    f.render_widget(Paragraph::new(Line::from(hline)), rows[4]);
-
-    let mut mline = vec![lbl(FIELD_MODEL, "model")];
-    mline.extend(picker(form.field == FIELD_MODEL, form.model(), form.model_idx, presets.len()).spans);
-    f.render_widget(Paragraph::new(Line::from(mline)), rows[5]);
-
-    let wt = if form.worktree_new { "new git worktree (isolated)" } else { "current repo (shared)" };
-    let mut wline = vec![lbl(FIELD_WORKTREE, "worktree")];
-    wline.extend(picker(form.field == FIELD_WORKTREE, wt, if form.worktree_new {0} else {1}, 2).spans);
-    f.render_widget(Paragraph::new(Line::from(wline)), rows[6]);
 
     let img = if let Some(buf) = &form.image_input {
-        format!("   typing path: {}_", buf)
+        format!("typing path: {}_", buf)
     } else if form.images.is_empty() {
-        "   (none — [a] add, [d] remove)".to_string()
+        "(none — [a] add, [d] remove)".to_string()
     } else {
-        format!("   {}  ([a] add, [d] remove)", form.images.join(", "))
+        format!("{}  ([a] add, [d] remove)", form.images.join(", "))
     };
-    let mut iline = vec![lbl(FIELD_IMAGES, "images")];
-    iline.push(Span::styled(img, Style::default().fg(Color::Gray)));
-    f.render_widget(Paragraph::new(Line::from(iline)), rows[7]);
+    f.render_widget(Paragraph::new(Line::from(vec![lbl(FIELD_IMAGES, "images"),
+        Span::styled(img, Style::default().fg(Color::Gray))])), rows[5]);
+
+    // say exactly where this lands before anything is created
+    let base = if app.repo_branch.is_empty() { "HEAD".to_string() } else { app.repo_branch.clone() };
+    let where_ = if app.is_git && form.worktree_new {
+        let slug = crate::app::slugify(&form.task_text());
+        let slug = slug.rsplit_once('-').map(|(a, _)| a).unwrap_or(&slug).to_string();
+        format!("  → new branch crew/{}-… off {}", slug, base)
+    } else if app.is_git {
+        format!("  → works directly on {} in {}", base, app.path())
+    } else {
+        format!("  → runs in {}", app.path())
+    };
+    f.render_widget(Paragraph::new(Span::styled(truncate(&where_, inner.width as usize),
+        Style::default().fg(Color::Yellow))), rows[6]);
 
     let mut hints = Vec::new();
     if let Some(err) = &form.error {
         hints.push(Line::from(Span::styled(format!("  ⚠ {}", err), Style::default().fg(Color::Red))));
     }
     hints.push(Line::from(Span::styled(
-        "  [tab] next field   [←→] change   [ Ctrl-S ] launch & chat   [esc] cancel",
+        "  [enter] launch [alt-enter] newline [tab] field [h/l] pick [esc] cancel",
         Style::default().fg(Color::DarkGray))));
-    f.render_widget(Paragraph::new(hints).wrap(Wrap { trim: false }), rows[8]);
+    f.render_widget(Paragraph::new(hints).wrap(Wrap { trim: false }), rows[7]);
 }
 
 fn draw_help(f: &mut Frame, app: &App) {
-    let area = centered(64, 92, f.area());
+    let area = centered(86, 92, f.area());
     f.render_widget(Clear, area);
     // grouped cheatsheet (lazygit-style): (section, [(keys, desc)])
     let groups: [(&str, &[(&str, &str)]); 6] = [
-        ("Navigate", &[
-            ("j / k · ↑ / ↓", "move selection"),
-            ("g / G", "jump to top / bottom"),
-            ("PgUp/Dn · ^u/^d", "page / half-page the list"),
-            ("] / [", "jump to next / prev failed agent"),
-            ("space / A", "mark row / mark all · esc clears marks"),
-            ("click / wheel", "select a row · scroll"),
+        ("Navigate (vim)", &[
+            ("j / k · ↑ / ↓", "move"),
+            ("h / l · ← / →", "repos pane · open (chat / resume / log)"),
+            ("g / G · ^d / ^u", "top / bottom · half page (lists + viewers)"),
+            ("tab · a", "toggle panes · back to all repos"),
+            ("] / [", "next / prev failed agent"),
+            ("space / A", "mark row / mark all"),
+            ("esc", "clear marks → search → category"),
         ]),
         ("Launch & drive", &[
-            ("n", "new agent (workflow: chat / plan→build / plan-only)"),
-            ("enter", "chat with a live agent, or resume a ▷ one"),
-            ("shift-tab", "(in chat) cycle the agent's modes, e.g. plan"),
-            ("D", "duplicate into a prefilled new-agent form"),
-            ("Ctrl-o", "leave the terminal, back to the dashboard"),
+            ("n · D", "new agent · duplicate selected into the form"),
+            ("enter / l", "chat (live) · resume ▷"),
+            ("Ctrl-q", "leave the chat"),
+            ("z", "zoom chat / preview to full width"),
+            ("wheel · S-PgUp/Dn", "scroll the chat's history (typing returns)"),
+            ("Shift-drag", "select text to copy (crew captures the mouse)"),
+            ("paste", "on the list: starts a new agent with it as the task"),
+            ("trust", "untrusted repo: claude defaults to No — pick Yes, or run claude in the repo once"),
+            ("shift-tab", "(in chat) cycle the agent's modes"),
+            ("w", "pin another repo"),
         ]),
         ("Inspect", &[
-            ("d", "review the worktree diff (colored)"),
-            ("l", "tail the log — live-follows at the bottom"),
-            ("o / y", "worktree path · yank it to the clipboard"),
-            ("Y", "yank the branch name"),
-            ("e / !", "open worktree in $EDITOR · drop to a $SHELL"),
+            ("d / L", "worktree diff · log tail (headless agents)"),
+            ("o / y / Y", "worktree path · yank path · yank branch"),
+            ("e / !", "$EDITOR · $SHELL in the worktree"),
         ]),
         ("Ship", &[
-            ("P", "commit + push (selected or all marked), open PR (gh)"),
-            ("O", "open the branch on the remote in a browser (gh)"),
-            ("f", "git fetch origin (refreshes ahead/behind)"),
-            ("R", "retry: re-delegate the task (needs engine)"),
+            ("P", "commit + push selected/marked, open PR (gh)"),
+            ("O / f", "open PR/branch in browser · git fetch"),
+            ("R", "retry on another harness (engine only)"),
         ]),
         ("Manage", &[
-            ("s / S", "stop selected/marked · stop ALL running"),
-            ("x / c", "remove selected/marked · clear finished"),
-            ("L", "label / rename a crew-launched agent"),
+            ("s / S", "stop selected/marked · stop all (resumable)"),
+            ("x / c", "remove selected/marked · forget finished"),
+            ("r", "rename (label) an agent"),
         ]),
         ("Filter & sort", &[
             ("1 2 3 4", "all / running / agents / sessions"),
-            ("t", "cycle sort: status → cost → recent"),
-            ("/ · h", "search · toggle observed sessions"),
-            (",", "settings — default harness/model/workflow"),
+            ("/ · t · H", "search · cycle sort · hide observed sessions"),
+            (",", "settings: default harness/model/workflow"),
         ]),
     ];
     let mut lines: Vec<Line> = Vec::new();
@@ -683,7 +897,7 @@ fn draw_help(f: &mut Frame, app: &App) {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
         for (k, d) in rows {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<15}", k), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {:<19}", k), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
                 Span::styled(d.to_string(), Style::default().fg(Color::Gray)),
             ]));
         }
@@ -691,6 +905,7 @@ fn draw_help(f: &mut Frame, app: &App) {
     }
     lines.push(Line::from(vec![
         Span::styled(" legend  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("⏸ waiting  ", Style::default().fg(Color::Yellow)),
         Span::styled("● running  ", Style::default().fg(Color::Green)),
         Span::styled("✓ done  ", Style::default().fg(Color::Green)),
         Span::styled("✗ failed  ", Style::default().fg(Color::Red)),
@@ -700,7 +915,65 @@ fn draw_help(f: &mut Frame, app: &App) {
     ]));
     f.render_widget(Paragraph::new(lines)
         .scroll((app.help_scroll, 0))
-        .block(panel_focused(" help — [j/k] scroll · any other key closes ", ACCENT)), area);
+        .block(panel_focused(" help — [j/k ^d/^u g/G] scroll · any other key closes ", ACCENT)), area);
+}
+
+/// Modal folder browser for pinning a new workspace.
+fn draw_browser(f: &mut Frame, app: &App) {
+    let area = centered(74, 82, f.area());
+    f.render_widget(Clear, area);
+    let b = &app.browser;
+    let inner_w = area.width.saturating_sub(4) as usize;
+
+    let path_line = if b.editing {
+        vec![
+            Span::styled("  path  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}_", b.typed), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]
+    } else {
+        vec![
+            Span::styled("  dir   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(truncate(&b.cwd.to_string_lossy(), inner_w.saturating_sub(8)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(path_line),
+        Line::from(""),
+    ];
+    // scroll window around the selection so long dirs stay usable
+    let (_, list_h) = (area.height, area.height.saturating_sub(7) as usize);
+    let start = b.selected.saturating_sub(list_h.saturating_sub(1));
+    for (i, (name, _)) in b.entries.iter().enumerate().skip(start).take(list_h) {
+        let selected = i == b.selected;
+        let style = if selected {
+            Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let prefix = if selected { "▶ " } else { "  " };
+        let pinned = name != ".." && app.workspaces.iter().any(|w| w.store.repo_root == b.cwd.join(name));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}{}/", prefix, name), style),
+            Span::styled(if pinned { "  · pinned" } else { "" }, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    if let Some(err) = &b.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(format!("  ⚠ {}", err), Style::default().fg(Color::Red))));
+    }
+    if b.editing {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  [type] path   [enter] go   [esc] cancel edit",
+            Style::default().fg(Color::DarkGray))));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  [j/k] move  [l] open  [h] up  [a] pin  [/] type path  [esc] cancel",
+            Style::default().fg(Color::DarkGray))));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false })
+        .block(panel_focused(" pin a repo ", ACCENT)), area);
 }
 
 /// Full-screen colored diff of the selected agent's worktree.
@@ -783,14 +1056,15 @@ fn draw_log(f: &mut Frame, app: &App) {
 fn draw_confirm(f: &mut Frame, app: &App) {
     let area = centered(50, 20, f.area());
     f.render_widget(Clear, area);
-    let what = if !app.marked.is_empty() {
-        format!("{} marked agent(s)", app.marked.len())
+    let what = if app.marked_total() > 0 {
+        format!("{} marked agent(s)", app.marked_total())
     } else {
-        format!("agent {}", app.selected_row().map(|r| r.id.clone()).unwrap_or_default())
+        format!("'{}'", truncate(app.selected_row().map(|r| r.display()).unwrap_or(""), 34))
     };
     let lines = vec![
         Line::from(""),
-        Line::from(Span::raw(format!("  Stop {} ?", what))),
+        Line::from(Span::raw(format!("  Stop {}?", what))),
+        Line::from(Span::styled("  it stays ▷ resumable", Style::default().fg(Color::DarkGray))),
         Line::from(""),
         Line::from(Span::styled("  [y] confirm   [n/esc] cancel", Style::default().fg(Color::DarkGray))),
     ];
@@ -801,7 +1075,7 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 fn draw_confirm_stop_all(f: &mut Frame, app: &App) {
     let area = centered(52, 20, f.area());
     f.render_widget(Clear, area);
-    let n = app.running_count();
+    let n = app.visible_rows().iter().filter(|r| r.is_live()).count();
     let lines = vec![
         Line::from(""),
         Line::from(Span::raw(format!("  Stop ALL {} running agent(s)?", n))),
@@ -815,11 +1089,12 @@ fn draw_confirm_stop_all(f: &mut Frame, app: &App) {
 fn draw_confirm_quit(f: &mut Frame, app: &App) {
     let area = centered(58, 26, f.area());
     f.render_widget(Clear, area);
-    let n = app.agents.len();
+    let n: usize = app.workspaces.iter()
+        .flat_map(|w| w.agents.iter()).filter(|p| p.tmux.is_none()).count();
     let dirty = app.dirty.values().filter(|d| **d).count();
     let mut lines = vec![
         Line::from(""),
-        Line::from(Span::styled(format!("  Quit? {} agent(s) will stop.", n),
+        Line::from(Span::styled(format!("  Quit? {} agent(s) will stop (pty backend).", n),
             Style::default().add_modifier(Modifier::BOLD))),
     ];
     if dirty > 0 {
@@ -829,12 +1104,9 @@ fn draw_confirm_quit(f: &mut Frame, app: &App) {
     }
     lines.extend([
         Line::from(""),
-        Line::from(Span::styled(
-            "  Their worktrees are kept — reopen the TUI and press",
-            Style::default().fg(Color::Gray))),
-        Line::from(Span::styled(
-            "  [enter] on a ▷ resumable agent to continue where it left off.",
-            Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("  Worktrees are kept; next time, [enter] on a ▷", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("  agent resumes its conversation. Install tmux to", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("  keep agents running after quit ([,] settings).", Style::default().fg(Color::Gray))),
         Line::from(""),
         Line::from(Span::styled("  [y] quit   [n/esc] cancel", Style::default().fg(Color::DarkGray))),
     ]);
@@ -919,7 +1191,8 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("crew"));
         assert!(text.contains("myrepo"));
-        assert!(text.contains("agents ("));
+        assert!(text.contains("agents ·"));
+        assert!(text.contains("all"), "all-repos row missing");
         assert!(text.contains("[n]ew"));
     }
 
@@ -958,8 +1231,9 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("new agent"));
         assert!(text.contains("task *"));
+        assert!(text.contains("repo") && text.contains("myrepo"));
         assert!(text.contains("harness"));
-        assert!(text.contains("worktree"));
-        assert!(text.contains("Ctrl-S"));
+        assert!(text.contains("options"), "advanced options should be collapsed");
+        assert!(text.contains("[enter] launch"));
     }
 }

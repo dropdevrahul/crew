@@ -8,6 +8,8 @@ use crate::pty::AgentProc;
 use crate::store::{AgentRecord, Store};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
+use std::path::PathBuf;
 use tui_textarea::TextArea;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,8 +24,10 @@ pub enum Mode {
     ConfirmPush,
     /// Edit persisted launch defaults.
     Settings,
-    /// Confirm removing the marked agents (bulk).
+    /// Confirm removing the selected / marked agents.
     ConfirmRemove,
+    /// Confirm forgetting every finished (exited + resumable) agent.
+    ConfirmClear,
     /// Text entry to label the selected agent.
     Rename,
     /// Esc pressed in the new-agent form with unsaved input — confirm discard.
@@ -37,6 +41,66 @@ pub enum Mode {
     Log,
     /// Pick a harness to re-delegate (retry) the selected row's task on.
     Retry,
+    /// Built-in folder browser used to pin a new workspace.
+    BrowseFolder,
+}
+
+/// Which pane the keyboard drives in Normal mode. Tab toggles between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Workspaces,
+    Agents,
+}
+
+/// Folder-browser state for `Mode::BrowseFolder`. Shows the folders under `cwd`
+/// and (while `editing`) accepts a typed path.
+#[derive(Debug, Clone)]
+pub struct WorkspaceBrowser {
+    pub cwd: PathBuf,
+    /// Typed path buffer (only meaningful while `editing`).
+    pub typed: String,
+    pub editing: bool,
+    /// Folder entries under `cwd`: (name, is_dir). Always directories (".."
+    /// first when a parent exists).
+    pub entries: Vec<(String, bool)>,
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+impl Default for WorkspaceBrowser {
+    fn default() -> Self {
+        let cwd = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        WorkspaceBrowser { cwd, typed: String::new(), editing: false, entries: Vec::new(), selected: 0, error: None }
+    }
+}
+
+impl WorkspaceBrowser {
+    /// Re-read the folders under `cwd` (dirs only, dotfiles hidden, ".." first).
+    fn refresh(&mut self) {
+        self.entries.clear();
+        if self.cwd.parent().is_some() {
+            self.entries.push(("..".to_string(), true));
+        }
+        let mut dirs: Vec<String> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.cwd) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    dirs.push(name);
+                }
+            }
+        }
+        dirs.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        self.entries.extend(dirs.into_iter().map(|n| (n, true)));
+        if self.selected >= self.entries.len() {
+            self.selected = self.entries.len().saturating_sub(1);
+        }
+    }
 }
 
 pub const HARNESSES: [&str; 3] = ["claude", "opencode", "cursor"];
@@ -122,13 +186,16 @@ pub fn model_presets(harness_idx: usize) -> &'static [&'static str] {
 }
 
 // New-agent form fields (task is a multiline editor and comes first).
+// Basic fields first; everything from FIELD_WORKFLOW on is "advanced" and
+// renders as one collapsed summary line until focused.
 pub const FIELD_TASK: usize = 0;
-pub const FIELD_WORKFLOW: usize = 1;
+pub const FIELD_REPO: usize = 1;
 pub const FIELD_HARNESS: usize = 2;
-pub const FIELD_MODEL: usize = 3;
-pub const FIELD_WORKTREE: usize = 4;
-pub const FIELD_IMAGES: usize = 5;
-pub const FIELD_COUNT: usize = 6;
+pub const FIELD_WORKFLOW: usize = 3;
+pub const FIELD_MODEL: usize = 4;
+pub const FIELD_WORKTREE: usize = 5;
+pub const FIELD_IMAGES: usize = 6;
+pub const FIELD_COUNT: usize = 7;
 
 pub struct NewAgentForm {
     pub task: TextArea<'static>,
@@ -145,12 +212,17 @@ pub struct NewAgentForm {
     pub image_input: Option<String>,
     pub field: usize,
     pub error: Option<String>,
+    /// Index into `App.workspaces`: the repo this agent launches in.
+    pub ws_idx: usize,
+    /// Claude Code already trusts the target repo (or a parent) — else its
+    /// first screen is a trust prompt whose DEFAULT is "No, exit".
+    pub claude_trusted: bool,
 }
 
 impl Default for NewAgentForm {
     fn default() -> Self {
         let mut task = TextArea::default();
-        task.set_placeholder_text("Describe the task… (Enter = newline)");
+        task.set_placeholder_text("Describe the task…  (Enter launches · Alt-Enter newline)");
         NewAgentForm {
             task,
             workflow_idx: 0,
@@ -161,6 +233,8 @@ impl Default for NewAgentForm {
             image_input: None,
             field: FIELD_TASK,
             error: None,
+            ws_idx: 0,
+            claude_trusted: true,
         }
     }
 }
@@ -218,10 +292,16 @@ impl NewAgentForm {
     }
 }
 
-pub struct App {
+/// One pinned folder's dashboard state: its store, live agents, registry, and
+/// every view/modal the key handlers touch. The `App` shell owns several of
+/// these and derefs to the active one.
+pub struct Workspace {
     pub store: Store,
     /// Live PTY-backed interactive agents (owned; die with the TUI).
     pub agents: Vec<AgentProc>,
+    /// Cached count of live agents (recomputed each `refresh`), so the
+    /// workspaces pane can show a badge without touching the PTYs.
+    pub live_count: usize,
     /// Persisted agents (survive restart; resumable via the harness).
     pub registry: Vec<AgentRecord>,
     pub rows: Vec<Row>,
@@ -229,7 +309,6 @@ pub struct App {
     pub mode: Mode,
     pub status_msg: String,
     pub new_form: NewAgentForm,
-    pub should_quit: bool,
     pub show_observed: bool,
     pub all_rows: Vec<Row>,
     pub filter_text: String,
@@ -268,6 +347,8 @@ pub struct App {
     /// Working copy of launch defaults while the Settings modal is open.
     pub settings: Option<crate::store::LaunchPrefs>,
     pub settings_field: usize,
+    /// Working copy of the global backend setting while Settings is open.
+    pub settings_backend: String,
     /// Text buffer while labeling an agent (Mode::Rename).
     pub rename_buf: String,
     /// Cached git status of the selected worktree: (path, summary, is_clean).
@@ -278,23 +359,35 @@ pub struct App {
     pub pr_map: HashMap<String, (i64, String)>,
     /// Per-agent-id: worktree has uncommitted changes (computed in refresh).
     pub dirty: HashMap<String, bool>,
+    /// Repo root is a git work tree (else: no worktree isolation offered).
+    pub is_git: bool,
+    /// Engine-sourced rows (delegated agents + observed sessions) from the last
+    /// full refresh; light refreshes reuse them instead of re-running python.
+    pub ext_rows: Vec<Row>,
+    /// Set when an agent finished or started waiting — the event loop rings
+    /// the terminal bell (+ desktop notification) once and clears it.
+    pub alert: bool,
 }
 
-impl App {
-    pub fn new(store: Store) -> App {
+impl Workspace {
+    pub fn new(store: Store) -> Workspace {
         let registry = store.load_registry();
         let repo_branch = git_branch(&store.repo_root.to_string_lossy());
         let prefs = store.load_prefs(); // remembered UI state
-        App {
+        let is_git = crate::store::is_git_repo(&store.repo_root);
+        if is_git {
+            store.ensure_excluded(); // .crew/ (registry, prefs) out of git status
+        }
+        Workspace {
             store,
             agents: Vec::new(),
+            live_count: 0,
             registry,
             rows: Vec::new(),
             selected: 0,
             mode: Mode::Normal,
             status_msg: String::new(),
             new_form: NewAgentForm::default(),
-            should_quit: false,
             show_observed: prefs.show_observed,
             all_rows: Vec::new(),
             filter_text: String::new(),
@@ -318,11 +411,15 @@ impl App {
             pending_shell: None,
             settings: None,
             settings_field: 0,
+            settings_backend: String::new(),
             rename_buf: String::new(),
             worktree_status: None,
             sel_remote: None,
             pr_map: HashMap::new(),
             dirty: HashMap::new(),
+            is_git,
+            ext_rows: Vec::new(),
+            alert: false,
         }
     }
 
@@ -366,6 +463,9 @@ impl App {
     /// Called on a slow timer, capped, and skipped while chatting.
     pub fn compute_dirty(&mut self) {
         self.dirty.clear();
+        if !self.is_git {
+            return; // no git → nothing can be "uncommitted"
+        }
         for r in self.all_rows.iter().take(20) {
             if let Some(wt) = &r.worktree {
                 self.dirty.insert(r.id.clone(), !worktree_clean(wt));
@@ -411,11 +511,13 @@ impl App {
     // ── settings (persisted launch defaults) ────────────────────────────────
     pub fn open_settings(&mut self) {
         self.settings = Some(self.store.load_prefs());
+        let b = crate::workspace::load_global().backend;
+        self.settings_backend = if b.is_empty() { "auto".into() } else { b };
         self.settings_field = 0;
         self.mode = Mode::Settings;
     }
     pub fn settings_move(&mut self, d: i64) {
-        self.settings_field = (((self.settings_field as i64 + d) % 4 + 4) % 4) as usize;
+        self.settings_field = (((self.settings_field as i64 + d) % 5 + 5) % 5) as usize;
     }
     pub fn settings_change(&mut self, d: i64) {
         let Some(p) = self.settings.as_mut() else { return };
@@ -433,13 +535,26 @@ impl App {
                 let n = WORKFLOWS.len() as i64;
                 p.workflow_idx = (((p.workflow_idx as i64 + d) % n + n) % n) as usize;
             }
-            _ => p.worktree_new = !p.worktree_new,
+            3 => p.worktree_new = !p.worktree_new,
+            _ => {
+                const B: [&str; 3] = ["auto", "tmux", "pty"];
+                let i = B.iter().position(|b| *b == self.settings_backend).unwrap_or(0) as i64;
+                self.settings_backend = B[(i + d).rem_euclid(3) as usize].into();
+            }
         }
     }
     pub fn save_settings(&mut self) {
         if let Some(mut p) = self.settings.take() {
             p.model_idx = p.model_idx.min(model_presets(p.harness_idx).len() - 1);
             self.store.save_prefs(&p);
+            // backend is machine-wide: global config, applies to new agents
+            let mut g = crate::workspace::load_global();
+            let saved = if g.backend.is_empty() { "auto" } else { g.backend.as_str() };
+            if saved != self.settings_backend {
+                g.backend = self.settings_backend.clone();
+                crate::workspace::save_global(&g);
+                crate::pty::set_backend(crate::pty::resolve_backend(&g.backend));
+            }
             self.status_msg = "settings saved".into();
         }
         self.mode = Mode::Normal;
@@ -475,21 +590,26 @@ impl App {
     /// Detect agents that just finished (running → done/failed) since the last
     /// refresh and surface a toast. Updates the remembered statuses.
     fn notify_completions(&mut self) {
+        let chatting = if self.mode == Mode::Terminal { self.selected_row().map(|r| r.id.clone()) } else { None };
         let mut just_done: Vec<(&str, &str)> = Vec::new();
         for r in &self.all_rows {
             if let Some(prev) = self.prev_status.get(&r.id) {
-                if prev == "running" && (r.status == "done" || r.status == "failed") {
-                    just_done.push((r.status.as_str(), r.task.as_str()));
+                let finished = prev == "running" && (r.status == "done" || r.status == "failed");
+                // went quiet at its prompt — unless you're the one typing to it
+                let needs_you = prev == "running" && r.waiting && chatting.as_ref() != Some(&r.id);
+                if finished || needs_you {
+                    just_done.push((r.status_label(), r.display()));
                 }
             }
         }
         if let Some((status, task)) = just_done.last() {
-            let icon = if *status == "done" { "✓" } else { "✗" };
+            let icon = match *status { "done" => "✓", "waiting" => "⏸", _ => "✗" };
             let short: String = task.chars().take(40).collect();
             let more = if just_done.len() > 1 { format!(" (+{} more)", just_done.len() - 1) } else { String::new() };
             self.status_msg = format!("{} {} — {}{}", icon, status, short, more);
+            self.alert = true;
         }
-        self.prev_status = self.all_rows.iter().map(|r| (r.id.clone(), r.status.clone())).collect();
+        self.prev_status = self.all_rows.iter().map(|r| (r.id.clone(), r.status_label().to_string())).collect();
     }
 
     pub fn apply_filter(&mut self) {
@@ -540,16 +660,40 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        self.refresh_with(true)
+    }
+
+    /// `full` also re-queries the engine (python) and the selected worktree's
+    /// git state; light refreshes (background workspaces) only re-read the
+    /// in-memory PTYs + registry, reusing the last engine rows.
+    pub fn refresh_with(&mut self, full: bool) -> Result<()> {
         // remember which agent is selected so the cursor follows it across a
         // re-sort (statuses change → row order changes) instead of jumping.
         let sel_id = self.selected_row().map(|r| r.id.clone());
         // live interactive agents first (from the owned PTY procs)
-        let mut rows: Vec<Row> = self
-            .agents
-            .iter_mut()
-            .enumerate()
-            .map(|(i, p)| Row::from_proc(i, p))
-            .collect();
+        self.reattach_tmux();
+        let mut rows: Vec<Row> = Vec::new();
+        for (i, p) in self.agents.iter_mut().enumerate() {
+            let mut row = Row::from_proc(i, p);
+            // an exited agent we launched is resumable — keep its last screen
+            // (proc_idx) for the preview, but [enter] relaunches it.
+            if !row.status.eq("running") {
+                if let Some(rec) = self.registry.iter().find(|r| r.id == row.id) {
+                    row = Row { proc_idx: Some(i), ..Row::from_record(rec) };
+                }
+            }
+            rows.push(row);
+        }
+        self.live_count = self.agents.iter_mut().map(|p| p.is_alive()).filter(|a| *a).count();
+        // the agent we're chatting with died → drop back to the dashboard
+        if self.mode == Mode::Terminal {
+            let sel = self.selected_row().map(|r| r.id.clone());
+            let alive = rows.iter().any(|r| Some(&r.id) == sel.as_ref() && r.is_live());
+            if !alive {
+                self.mode = Mode::Normal;
+                self.status_msg = "agent exited — [enter] to resume".into();
+            }
+        }
         let mut seen: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
         // persisted agents that aren't currently live → resumable
         for rec in &self.registry {
@@ -557,16 +701,26 @@ impl App {
                 rows.push(Row::from_record(rec));
             }
         }
-        // headless sub-agents delegated via dispatch/MCP (SQLite agents table)
-        for a in self.store.managed_agents() {
-            if seen.insert(a.agent_id.clone()) {
-                rows.push(Row::from_managed(&a));
+        if full {
+            self.ext_rows.clear();
+            // headless sub-agents delegated via dispatch/MCP (SQLite agents table)
+            if self.store.has_engine() {
+                self.ext_rows.extend(self.store.managed_agents().iter().map(Row::from_managed));
+                // observed plugin sessions (read-only, from the DB)
+                if self.show_observed {
+                    let sessions = self.store.sessions().unwrap_or_default();
+                    self.ext_rows.extend(sessions.iter().map(Row::from_session));
+                }
             }
         }
-        // observed plugin sessions (read-only, from the DB)
-        if self.show_observed {
-            let sessions = self.store.sessions().unwrap_or_default();
-            rows.extend(sessions.iter().map(Row::from_session));
+        for r in &self.ext_rows {
+            if r.kind == crate::agent::Kind::Observed {
+                if self.show_observed {
+                    rows.push(r.clone());
+                }
+            } else if seen.insert(r.id.clone()) {
+                rows.push(r.clone());
+            }
         }
         rows = merge_keep(rows);
         self.all_rows = rows;
@@ -589,10 +743,40 @@ impl App {
         // One or two git calls for the selected worktree only — cheap. (The
         // per-row dirty scan is heavier and runs on its own slow timer.) Skipped
         // while chatting to keep the PTY responsive.
-        if self.mode != Mode::Terminal {
+        if full && self.mode != Mode::Terminal {
             self.update_sel_status();
         }
         Ok(())
+    }
+
+    /// Registry agents whose tmux session is alive but that we have no live
+    /// view of (crew restarted, or the client died): attach to them so they
+    /// show as running, not resumable.
+    fn reattach_tmux(&mut self) {
+        if !on_path("tmux") {
+            return;
+        }
+        let live = crate::pty::tmux_sessions();
+        if live.is_empty() {
+            return;
+        }
+        let (cols, rows) = self.term_size;
+        for rec in self.registry.clone() {
+            if !live.contains(&crate::pty::session_name(&rec.id)) {
+                continue;
+            }
+            if self.agents.iter_mut().any(|p| p.id == rec.id && p.is_alive()) {
+                continue;
+            }
+            self.agents.retain(|p| p.id != rec.id);
+            if let Ok(mut p) = AgentProc::spawn(rec.id.clone(), rec.harness.clone(), rec.model.clone(),
+                rec.task.clone(), rec.worktree.clone(), &[], rows, cols) {
+                if rec.created > 0.0 {
+                    p.started = rec.created; // age = since launch, not since re-attach
+                }
+                self.agents.push(p);
+            }
+        }
     }
 
     pub fn selected_row(&self) -> Option<&Row> {
@@ -616,30 +800,7 @@ impl App {
         // worktree's status refreshes on the next tick (≤800ms).
     }
 
-    pub fn sel_top(&mut self) {
-        self.selected = 0;
-    }
 
-    /// Jump to the next/prev failed agent (triage), wrapping around.
-    pub fn jump_failed(&mut self, dir: i64) {
-        let n = self.rows.len();
-        if n == 0 {
-            return;
-        }
-        for step in 1..=n {
-            let i = (self.selected as i64 + dir * step as i64).rem_euclid(n as i64) as usize;
-            if self.rows[i].status == "failed" {
-                self.selected = i;
-                return;
-            }
-        }
-        self.status_msg = "no failed agents".into();
-    }
-    pub fn sel_bottom(&mut self) {
-        if !self.rows.is_empty() {
-            self.selected = self.rows.len() - 1;
-        }
-    }
 
     /// Copy the selected agent's worktree path to the system clipboard.
     pub fn yank_worktree(&mut self) {
@@ -742,9 +903,17 @@ impl App {
         let p = self.store.load_prefs();
         let hn = HARNESSES.len();
         form.harness_idx = p.harness_idx.min(hn - 1);
+        // remembered harness uninstalled since? start on one that's on PATH
+        if !harness_installed(HARNESSES[form.harness_idx]) {
+            if let Some(i) = HARNESSES.iter().position(|h| harness_installed(h)) {
+                form.harness_idx = i;
+                form.model_idx = 0;
+            }
+        }
         form.model_idx = p.model_idx.min(model_presets(form.harness_idx).len() - 1);
         form.workflow_idx = p.workflow_idx.min(WORKFLOWS.len() - 1);
-        form.worktree_new = p.worktree_new;
+        form.worktree_new = p.worktree_new && self.is_git;
+        form.claude_trusted = claude_trusts(&self.store.repo_root);
         self.new_form = form;
         self.mode = Mode::NewAgent;
     }
@@ -905,10 +1074,16 @@ impl App {
             return;
         }
         let model = self.new_form.model().to_string();
-        let prompt = self.new_form.full_prompt();
         let (cols, rows) = self.term_size;
 
         // choose worktree: new isolated one, or the repo itself
+        if !self.is_git {
+            self.new_form.worktree_new = false; // plain folder: no worktree isolation
+        }
+        if !self.store.has_engine() {
+            self.new_form.workflow_idx = 0; // plan/build workflows need the engine's skills
+        }
+        let prompt = self.new_form.full_prompt();
         let (id, worktree) = if self.new_form.worktree_new {
             let slug = slugify(&self.new_form.task_text());
             match self.store.create_worktree(&slug) {
@@ -925,17 +1100,34 @@ impl App {
             )
         };
 
-        let argv = interactive_argv(&harness, &model);
+        // pin claude to a known conversation id so resume can't grab another
+        // agent's session sharing the same cwd (opencode/cursor: continue-latest)
+        let session_id = (harness == "claude").then(new_uuid);
+        let mut argv = interactive_argv(&harness, &model, &prompt, session_id.as_deref());
+        // fresh worktree + repo setup script → run it in the PTY first (output
+        // visible), then exec the harness
+        if self.new_form.worktree_new {
+            if let Some(setup) = self.store.setup_script() {
+                let mut w = vec![
+                    "sh".to_string(), "-c".into(),
+                    "echo \"crew: running $1\"; sh \"$1\" \"$2\" || echo 'crew: setup failed (continuing)'; shift 2; exec \"$@\"".into(),
+                    "sh".into(), setup.to_string_lossy().into(), self.store.repo_root.to_string_lossy().into(),
+                ];
+                w.append(&mut argv);
+                argv = w;
+            }
+        }
         let task_text = self.new_form.task_text();
         match AgentProc::spawn(
-            id.clone(), harness.clone(), model.clone(), prompt, worktree.clone(), &argv, rows, cols,
+            id.clone(), harness.clone(), model.clone(), task_text.clone(), worktree.clone(), &argv, rows, cols,
         ) {
             Ok(proc) => {
                 self.agents.push(proc);
                 // persist so it can be resumed after the TUI closes
                 self.registry.retain(|r| r.id != id);
                 self.registry.push(AgentRecord {
-                    id: id.clone(), harness, model, worktree, task: task_text, label: None,
+                    id: id.clone(), harness: harness.clone(), model, worktree, task: task_text, label: None,
+                    session_id, created: now_millis() as f64 / 1000.0,
                 });
                 self.store.save_registry(&self.registry);
                 // remember these launch choices (preserving stored UI state)
@@ -950,7 +1142,11 @@ impl App {
                     self.selected = i;
                 }
                 self.mode = Mode::Terminal; // drop straight into the chat
-                self.status_msg = format!("launched {} — Ctrl-o to leave the terminal", id);
+                self.status_msg = if harness == "claude" && !self.new_form.claude_trusted {
+                    "launched · claude asks to trust the folder: ↓ then Enter for Yes (default is No)".into()
+                } else {
+                    "launched · Ctrl-q → list".into()
+                };
             }
             Err(e) => self.new_form.error = Some(format!("{}", e)),
         }
@@ -961,22 +1157,58 @@ impl App {
     /// in the same worktree.
     pub fn open_selected(&mut self) {
         let Some(r) = self.selected_row().cloned() else { return };
-        if r.interactive {
+        if r.is_live() {
             self.mode = Mode::Terminal;
         } else if r.resumable {
             self.resume(&r.id);
+        } else if r.kind == crate::agent::Kind::Observed {
+            self.adopt_session(&r);
+        } else if r.log_path.is_some() {
+            self.show_log(); // headless agent: drill into its output
         } else {
-            self.status_msg = "not an interactive agent".into();
+            self.show_diff();
         }
+    }
+
+    /// Take over an observed Claude session as a crew agent: register it
+    /// (pinned to its session id, in the repo root) and resume it live.
+    fn adopt_session(&mut self, r: &Row) {
+        if !claude_session_exists(&r.id) {
+            self.status_msg = format!("no claude transcript for session {}", r.id);
+            return;
+        }
+        if !self.registry.iter().any(|x| x.id == r.id) {
+            self.registry.push(AgentRecord {
+                id: r.id.clone(), harness: "claude".into(), model: String::new(),
+                worktree: self.store.repo_root.to_string_lossy().to_string(),
+                task: r.task.clone(), label: None,
+                session_id: Some(r.id.clone()), created: r.updated_ts,
+            });
+            self.store.save_registry(&self.registry);
+        }
+        let id = r.id.clone();
+        self.resume(&id);
     }
 
     fn resume(&mut self, id: &str) {
         let Some(rec) = self.registry.iter().find(|r| r.id == id).cloned() else { return };
+        if !std::path::Path::new(&rec.worktree).is_dir() {
+            self.status_msg = format!("can't resume: worktree gone ({}) — [x] to remove", rec.worktree);
+            return;
+        }
+        let overridden = std::env::var(format!("CREW_RESUME_CMD_{}", rec.harness.to_uppercase()))
+            .map(|v| !v.trim().is_empty()).unwrap_or(false);
+        if !overridden && !harness_installed(&rec.harness) {
+            self.status_msg = format!("can't resume: '{}' not on PATH", harness_bin(&rec.harness));
+            return;
+        }
         let (cols, rows) = self.term_size;
-        let argv = resume_argv(&rec.harness, &rec.model);
+        let argv = resume_argv(&rec.harness, &rec.model, rec.session_id.as_deref());
+        // drop the dead proc (kept only for its last screen) before relaunching
+        self.agents.retain_mut(|p| p.id != rec.id || p.is_alive());
         // no task seed on resume — the harness restores the prior conversation
         match AgentProc::spawn(
-            rec.id.clone(), rec.harness.clone(), rec.model.clone(), String::new(),
+            rec.id.clone(), rec.harness.clone(), rec.model.clone(), rec.task.clone(),
             rec.worktree.clone(), &argv, rows, cols,
         ) {
             Ok(proc) => {
@@ -986,7 +1218,7 @@ impl App {
                     self.selected = i;
                 }
                 self.mode = Mode::Terminal;
-                self.status_msg = format!("resumed {} — Ctrl-o to leave", rec.id);
+                self.status_msg = "resumed · Ctrl-q → list".into();
             }
             Err(e) => self.status_msg = format!("resume failed: {}", e),
         }
@@ -1011,31 +1243,13 @@ impl App {
         self.marked.clear();
         let _ = self.refresh();
         self.status_msg = if n > 0 {
-            format!("stopped {}", n)
+            format!("stopped {} · [enter] resumes", n)
         } else {
             "no live agents in selection".into()
         };
     }
 
     // ── multi-select ──────────────────────────────────────────────────────
-    /// Toggle the mark on the selected row and advance (fast bulk marking).
-    pub fn toggle_mark(&mut self) {
-        if let Some(id) = self.selected_row().map(|r| r.id.clone()) {
-            if !self.marked.remove(&id) {
-                self.marked.insert(id);
-            }
-        }
-        self.move_sel(1);
-    }
-    pub fn mark_all_visible(&mut self) {
-        for r in &self.rows {
-            self.marked.insert(r.id.clone());
-        }
-        self.status_msg = format!("{} marked", self.marked.len());
-    }
-    pub fn clear_marks(&mut self) {
-        self.marked.clear();
-    }
     /// Ids to act on: the marked set (intersected with visible rows) if any,
     /// else just the selected row.
     fn target_ids(&self) -> HashSet<String> {
@@ -1212,23 +1426,7 @@ impl App {
         self.store.save_prefs(&p);
     }
 
-    pub fn running_count(&self) -> usize {
-        self.rows.iter().filter(|r| r.status == "running").count()
-    }
 
-    /// Kill every live interactive agent at once. Registry rows are kept so they
-    /// stay resumable.
-    pub fn stop_all(&mut self) {
-        let mut n = 0;
-        for p in &mut self.agents {
-            if p.is_alive() {
-                p.kill();
-                n += 1;
-            }
-        }
-        let _ = self.refresh();
-        self.status_msg = format!("stopped {} agent(s)", n);
-    }
 
     /// Drop finished work: remove exited live procs and forget persisted rows
     /// that aren't currently running. Keeps everything still alive.
@@ -1249,51 +1447,683 @@ impl App {
         let _ = self.refresh();
         self.status_msg = format!("cleared {} finished", removed);
     }
+
+    /// Absolute path identifying this workspace (its git toplevel, or the
+    /// pinned folder when it isn't a repo).
+    pub fn path(&self) -> String {
+        self.store.repo_root.to_string_lossy().to_string()
+    }
+
+    /// Display name for this workspace (the folder's basename).
+    pub fn name(&self) -> String {
+        self.store
+            .repo_root
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.store.repo_root.to_string_lossy().to_string())
+    }
+}
+
+/// The application shell: an ordered list of pinned workspaces plus the pane
+/// focus, the global-config-backed selection, and the folder-browser modal.
+/// It derefs to the *active* workspace, so all the existing agent actions
+/// (`app.refresh()`, `app.rows`, …) transparently target the focused workspace.
+///
+/// Background agents in unfocused workspaces keep running: each `Workspace`
+/// owns its own PTY `AgentProc`s.
+pub struct App {
+    pub workspaces: Vec<Workspace>,
+    /// Index of the workspace actions target. In the all-repos view it follows
+    /// the selected row, so every per-workspace action just works.
+    pub active: usize,
+    /// Cursor in the workspaces pane: 0 = "all", i+1 = workspaces[i].
+    pub ws_cursor: usize,
+    /// Show every workspace's agents in one list (the default home).
+    pub view_all: bool,
+    /// Workspace of the folder crew was launched from (default launch repo).
+    pub cwd_ws: Option<usize>,
+    /// Right pane takes the full width (roomier chat).
+    pub zoom: bool,
+    pub focus: Focus,
+    pub should_quit: bool,
+    pub browser: WorkspaceBrowser,
+    /// Round-robin index for background full refreshes (engine rows).
+    bg_full: usize,
+}
+
+impl App {
+    fn shell(workspaces: Vec<Workspace>, active: usize) -> App {
+        App {
+            workspaces, active, ws_cursor: 0, view_all: true, cwd_ws: None, zoom: false,
+            focus: Focus::Agents, should_quit: false, browser: WorkspaceBrowser::default(), bg_full: 0,
+        }
+    }
+
+    /// Wrap a single workspace (tests, and the first-run path).
+    pub fn new(store: Store) -> App {
+        App::shell(vec![Workspace::new(store)], 0)
+    }
+
+    /// Build the shell from a persisted global config. Missing folders are
+    /// skipped; an empty/absent config falls back to the current directory.
+    pub fn from_config(cfg: &crate::workspace::GlobalConfig, scripts: Option<&std::path::Path>) -> App {
+        let mut workspaces: Vec<Workspace> = Vec::new();
+        for e in &cfg.workspaces {
+            let p = PathBuf::from(&e.path);
+            if p.is_dir() {
+                workspaces.push(crate::workspace::workspace_from_path(&p, scripts));
+            }
+        }
+        if workspaces.is_empty() {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            workspaces.push(crate::workspace::workspace_from_path(&cwd, scripts));
+        }
+        let active = cfg.active.min(workspaces.len() - 1);
+        App::shell(workspaces, active)
+    }
+
+    /// Note the launch folder: pin it quietly if it's an unpinned git repo
+    /// (never switches the view — crew opens on "all"), and remember it as the
+    /// default repo for new agents. Returns true if it pinned (caller saves).
+    pub fn adopt_cwd(&mut self, cwd: &std::path::Path, scripts: Option<&std::path::Path>) -> bool {
+        let root = crate::store::git_toplevel(cwd);
+        if let Some(i) = self.workspaces.iter().position(|w| w.store.repo_root == root) {
+            self.cwd_ws = Some(i);
+        } else if crate::store::is_git_repo(cwd) {
+            self.workspaces.push(crate::workspace::workspace_from_path(cwd, scripts));
+            self.cwd_ws = Some(self.workspaces.len() - 1);
+            return true;
+        }
+        false
+    }
+
+    pub fn active(&self) -> &Workspace {
+        &self.workspaces[self.active]
+    }
+    pub fn active_mut(&mut self) -> &mut Workspace {
+        let i = self.active;
+        &mut self.workspaces[i]
+    }
+
+    /// Make workspace `i` the action target, carrying the view state (search,
+    /// category, sort, sizes) over so the list doesn't change under you.
+    pub fn switch_active(&mut self, i: usize) {
+        if i == self.active || i >= self.workspaces.len() {
+            return;
+        }
+        let from = self.active;
+        let (filter, cat, sort, obs, size, msg) = {
+            let w = &mut self.workspaces[from];
+            (w.filter_text.clone(), w.category, w.sort, w.show_observed, w.term_size, std::mem::take(&mut w.status_msg))
+        };
+        self.active = i;
+        let w = &mut self.workspaces[i];
+        w.filter_text = filter;
+        w.category = cat;
+        w.sort = sort;
+        w.show_observed = obs;
+        w.term_size = size;
+        if w.status_msg.is_empty() {
+            w.status_msg = msg;
+        }
+        w.apply_filter();
+    }
+
+    // ── the list (one repo, or all of them) ─────────────────────────────────
+    /// Rows shown in the agents pane, each tagged with its workspace. In the
+    /// all view: every workspace's filtered rows, merged and re-sorted.
+    pub fn visible_rows(&self) -> Vec<Row> {
+        if !self.view_all {
+            let a = self.active;
+            return self.active().rows.iter().cloned().map(|r| Row { ws: a, ..r }).collect();
+        }
+        let mut rows: Vec<Row> = self.workspaces.iter().enumerate()
+            .flat_map(|(i, w)| w.rows.iter().cloned().map(move |r| Row { ws: i, ..r }))
+            .collect();
+        match self.sort {
+            SortKey::Status => rows.sort_by_key(Row::rank),
+            SortKey::Cost => rows.sort_by(|a, b| b.cost_usd.total_cmp(&a.cost_usd)),
+            SortKey::Recent => rows.sort_by(|a, b| b.updated_ts.total_cmp(&a.updated_ts)),
+        }
+        rows
+    }
+
+    /// Position of the selected row within `visible_rows()`.
+    pub fn visible_index(&self, rows: &[Row]) -> usize {
+        let id = self.active().selected_row().map(|r| r.id.clone());
+        rows.iter().position(|r| r.ws == self.active && Some(&r.id) == id.as_ref()).unwrap_or(0)
+    }
+
+    /// Select `rows[i]`: switch to its workspace and point that list at it.
+    fn select_visible(&mut self, rows: &[Row], i: usize) {
+        let Some(r) = rows.get(i) else { return };
+        self.switch_active(r.ws);
+        let w = self.active_mut();
+        if let Some(j) = w.rows.iter().position(|x| x.id == r.id) {
+            w.selected = j;
+        }
+    }
+
+    pub fn move_sel(&mut self, d: i64) {
+        if !self.view_all {
+            return self.active_mut().move_sel(d);
+        }
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let i = (self.visible_index(&rows) as i64 + d).clamp(0, rows.len() as i64 - 1) as usize;
+        self.select_visible(&rows, i);
+    }
+    pub fn sel_top(&mut self) {
+        self.move_sel(i64::MIN / 2);
+    }
+    pub fn sel_bottom(&mut self) {
+        self.move_sel(i64::MAX / 2);
+    }
+    /// Select by on-screen list index (mouse).
+    pub fn select_index(&mut self, i: usize) {
+        let rows = self.visible_rows();
+        self.select_visible(&rows, i);
+    }
+    pub fn jump_failed(&mut self, dir: i64) {
+        let rows = self.visible_rows();
+        let n = rows.len();
+        let cur = self.visible_index(&rows);
+        for step in 1..=n {
+            let i = (cur as i64 + dir * step as i64).rem_euclid(n as i64) as usize;
+            if rows[i].status == "failed" {
+                return self.select_visible(&rows, i);
+            }
+        }
+        self.status_msg = "no failed agents".into();
+    }
+
+    // ── marks span workspaces ───────────────────────────────────────────────
+    pub fn marked_total(&self) -> usize {
+        self.workspaces.iter().map(|w| w.marked.len()).sum()
+    }
+    pub fn toggle_mark(&mut self) {
+        if let Some(id) = self.selected_row().map(|r| r.id.clone()) {
+            let w = self.active_mut();
+            if !w.marked.remove(&id) {
+                w.marked.insert(id);
+            }
+        }
+        self.move_sel(1);
+    }
+    pub fn mark_all_visible(&mut self) {
+        for r in self.visible_rows() {
+            self.workspaces[r.ws].marked.insert(r.id);
+        }
+        self.status_msg = format!("{} marked", self.marked_total());
+    }
+    pub fn clear_marks(&mut self) {
+        for w in &mut self.workspaces {
+            w.marked.clear();
+        }
+    }
+    /// Run a selection-or-marks action: on every workspace holding marks, or
+    /// just the active one (its selected row) when nothing is marked.
+    fn bulk(&mut self, f: impl Fn(&mut Workspace)) {
+        if self.marked_total() == 0 {
+            return f(self.active_mut());
+        }
+        let msgs: Vec<String> = self.workspaces.iter_mut()
+            .filter(|w| !w.marked.is_empty())
+            .map(|w| { f(w); w.mode = Mode::Normal; std::mem::take(&mut w.status_msg) })
+            .collect();
+        self.active_mut().status_msg = msgs.join(" · ");
+    }
+    pub fn stop_selected(&mut self) {
+        self.bulk(|w| w.stop_selected());
+    }
+    pub fn remove_selected(&mut self) {
+        self.bulk(|w| w.remove_selected());
+    }
+    /// Queue push for the selection / marks in every workspace.
+    pub fn open_push(&mut self) {
+        self.bulk(|w| w.open_push());
+        let n: usize = self.workspaces.iter().map(|w| w.push_queue.len()).sum();
+        self.active_mut().mode = if n > 0 { Mode::ConfirmPush } else { Mode::Normal };
+    }
+    pub fn push_total(&self) -> usize {
+        self.workspaces.iter().map(|w| w.push_queue.len()).sum()
+    }
+    pub fn confirm_push(&mut self) {
+        let msgs: Vec<String> = self.workspaces.iter_mut()
+            .filter(|w| !w.push_queue.is_empty())
+            .map(|w| { w.confirm_push(); std::mem::take(&mut w.status_msg) })
+            .collect();
+        self.active_mut().mode = Mode::Normal;
+        self.active_mut().status_msg = msgs.join(" · ");
+    }
+    pub fn cancel_push(&mut self) {
+        for w in &mut self.workspaces {
+            w.push_queue.clear();
+        }
+        self.active_mut().mode = Mode::Normal;
+    }
+    /// Workspaces the current view covers (all of them, or just the active).
+    fn in_view(&self) -> Vec<usize> {
+        if self.view_all { (0..self.workspaces.len()).collect() } else { vec![self.active] }
+    }
+    /// `S`: stop every live agent in view (all repos in the all view).
+    pub fn stop_all(&mut self) {
+        let mut n = 0;
+        for i in self.in_view() {
+            for p in &mut self.workspaces[i].agents {
+                if p.is_alive() {
+                    p.kill();
+                    n += 1;
+                }
+            }
+        }
+        self.tick();
+        self.status_msg = format!("stopped {} agent(s) · [enter] resumes", n);
+    }
+    /// `c`: forget finished agents in view.
+    pub fn clear_finished(&mut self) {
+        let msgs: Vec<String> = self.in_view().into_iter()
+            .map(|i| { let w = &mut self.workspaces[i]; w.clear_finished(); std::mem::take(&mut w.status_msg) })
+            .collect();
+        self.status_msg = msgs.join(" · ");
+    }
+
+    pub fn set_show_observed(&mut self, on: bool) {
+        for w in &mut self.workspaces {
+            w.show_observed = on;
+            let _ = w.refresh();
+        }
+    }
+
+    // ── new-agent form targets a repo ───────────────────────────────────────
+    /// Open the form, defaulting its repo to: the repo you're looking at, else
+    /// the launch folder's, else the one you last acted on.
+    pub fn open_new_agent(&mut self) {
+        let target = if self.view_all { self.cwd_ws.unwrap_or(self.active) } else { self.active };
+        self.switch_active(target);
+        self.active_mut().open_new_agent();
+        self.new_form.ws_idx = target;
+    }
+    pub fn duplicate_selected(&mut self) {
+        self.active_mut().duplicate_selected();
+        self.new_form.ws_idx = self.active;
+        self.new_form.worktree_new = self.is_git;
+    }
+    /// Cycle the form's repo; the form moves with it (it lives per workspace).
+    pub fn cycle_form_repo(&mut self, d: i64) {
+        let n = self.workspaces.len() as i64;
+        let to = (self.new_form.ws_idx as i64 + d).rem_euclid(n) as usize;
+        let mut form = std::mem::take(&mut self.active_mut().new_form);
+        self.active_mut().mode = Mode::Normal;
+        self.switch_active(to);
+        form.ws_idx = to;
+        if !self.is_git {
+            form.worktree_new = false;
+        }
+        form.claude_trusted = claude_trusts(&self.store.repo_root);
+        self.new_form = form;
+        self.mode = Mode::NewAgent;
+    }
+    pub fn spawn_from_form(&mut self) {
+        self.active_mut().spawn_from_form();
+        if self.mode == Mode::Terminal && !self.view_all {
+            self.ws_cursor = self.active + 1;
+        }
+    }
+
+
+    /// Refresh tick: the active workspace fully, the rest lightly (PTYs +
+    /// registry), plus one background workspace's engine rows per call.
+    /// Background toasts (✓ done / ⏸ needs input) surface in the active header.
+    pub fn tick(&mut self) {
+        let active = self.active;
+        let n = self.workspaces.len();
+        self.bg_full = (self.bg_full + 1) % n.max(1);
+        let bg_full = self.bg_full;
+        let mut toasts = Vec::new();
+        for (i, w) in self.workspaces.iter_mut().enumerate() {
+            if i == active {
+                continue;
+            }
+            let _ = w.refresh_with(i == bg_full);
+            if !w.status_msg.is_empty() {
+                toasts.push(format!("[{}] {}", w.name(), std::mem::take(&mut w.status_msg)));
+            }
+        }
+        let _ = self.active_mut().refresh();
+        if let Some(t) = toasts.pop() {
+            self.active_mut().status_msg = t;
+        }
+    }
+
+    /// Take the pending alert, if any workspace raised one: the message to
+    /// notify with (the header toast).
+    pub fn take_alert(&mut self) -> Option<String> {
+        let mut any = false;
+        for w in &mut self.workspaces {
+            any |= std::mem::take(&mut w.alert);
+        }
+        any.then(|| self.status_msg.clone())
+    }
+
+
+    /// On quit: tmux agents keep running (we drop only our viewer); pty agents
+    /// can't outlive crew, so they're killed — never orphaned.
+    pub fn detach_all(&mut self) {
+        for w in &mut self.workspaces {
+            for p in &mut w.agents {
+                p.detach();
+            }
+        }
+    }
+
+    /// Live agents that would die on quit (pty-backed, not tmux).
+    pub fn live_mortal(&mut self) -> usize {
+        self.workspaces.iter_mut()
+            .map(|w| w.agents.iter_mut().filter(|p| p.tmux.is_none()).map(|p| p.is_alive()).filter(|a| *a).count())
+            .sum()
+    }
+
+    /// Flip keyboard focus between the workspaces pane and the agents pane.
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Agents => Focus::Workspaces,
+            Focus::Workspaces => Focus::Agents,
+        };
+    }
+
+    // ── workspaces pane navigation (row 0 = all) ────────────────────────────
+    pub fn ws_move(&mut self, d: i64) {
+        let n = self.workspaces.len() as i64 + 1;
+        self.ws_cursor = (self.ws_cursor as i64 + d).clamp(0, n - 1) as usize;
+    }
+    pub fn ws_top(&mut self) {
+        self.ws_cursor = 0;
+    }
+    pub fn ws_bottom(&mut self) {
+        self.ws_cursor = self.workspaces.len();
+    }
+
+    /// Open the entry under the cursor: "all", or narrow to one workspace.
+    pub fn select_workspace(&mut self) {
+        if self.ws_cursor == 0 {
+            self.view_all = true;
+        } else if self.ws_cursor <= self.workspaces.len() {
+            self.view_all = false;
+            self.switch_active(self.ws_cursor - 1);
+            let _ = self.active_mut().refresh();
+        }
+    }
+
+    // ── pin / unpin ─────────────────────────────────────────────────────────
+    /// Pin a folder as a new workspace and narrow to it. Refuses duplicates.
+    pub fn add_workspace(&mut self, path: PathBuf) -> Result<()> {
+        if !path.is_dir() {
+            return Err(anyhow::anyhow!("not a folder: {}", path.display()));
+        }
+        let root = crate::store::git_toplevel(&path);
+        if let Some(i) = self.workspaces.iter().position(|w| w.store.repo_root == root) {
+            // already there → just go to it instead of erroring
+            self.ws_cursor = i + 1;
+            self.select_workspace();
+            self.active_mut().status_msg = format!("{} is already pinned", self.workspaces[i].name());
+            return Ok(());
+        }
+        let ws = crate::workspace::workspace_from_path(&path, None);
+        self.workspaces.push(ws);
+        let i = self.workspaces.len() - 1;
+        self.ws_cursor = i + 1;
+        self.select_workspace();
+        self.save_global();
+        Ok(())
+    }
+
+    /// Unpin the workspace at `idx` — keeps its worktrees/data on disk. Refuses
+    /// the last workspace and any with live agents (unpinning would kill them).
+    pub fn remove_workspace(&mut self, idx: usize) {
+        if idx >= self.workspaces.len() {
+            return;
+        }
+        if self.workspaces.len() <= 1 {
+            self.active_mut().status_msg = "can't unpin the last workspace".into();
+            return;
+        }
+        if self.workspaces[idx].agents.iter_mut().any(|p| p.is_alive()) {
+            self.active_mut().status_msg = "stop its running agents before unpinning".into();
+            return;
+        }
+        self.workspaces.remove(idx);
+        let fix = |i: usize| if i > idx { i - 1 } else { i };
+        self.active = fix(self.active).min(self.workspaces.len() - 1);
+        self.cwd_ws = self.cwd_ws.filter(|c| *c != idx).map(fix);
+        self.ws_cursor = self.ws_cursor.min(self.workspaces.len());
+        if self.ws_cursor == 0 {
+            self.view_all = true;
+        }
+        self.save_global();
+    }
+
+    pub fn remove_workspace_at_selected(&mut self) {
+        if self.ws_cursor == 0 {
+            self.active_mut().status_msg = "\"all\" isn't a pinned folder".into();
+            return;
+        }
+        self.remove_workspace(self.ws_cursor - 1);
+    }
+
+    /// Persist the pinned list + active index to the global config.
+    pub fn save_global(&self) {
+        let cfg = crate::workspace::GlobalConfig {
+            version: 1,
+            backend: crate::workspace::load_global().backend, // owned by settings
+            active: self.active,
+            workspaces: self
+                .workspaces
+                .iter()
+                .map(|w| crate::workspace::WorkspaceEntry {
+                    path: w.path(),
+                    name: w.name(),
+                })
+                .collect(),
+        };
+        crate::workspace::save_global(&cfg);
+    }
+
+    // ── folder browser (Mode::BrowseFolder) ─────────────────────────────────
+    /// Open the folder picker beside the current repo (new repos are usually
+    /// its siblings), with the current repo highlighted.
+    pub fn open_browser(&mut self) {
+        let root = self.active().store.repo_root.clone();
+        self.browser = WorkspaceBrowser { cwd: root, ..Default::default() };
+        self.browser_up();
+        self.mode = Mode::BrowseFolder;
+    }
+    /// Go to the parent folder, keeping the folder we left highlighted (lf/ranger).
+    pub fn browser_up(&mut self) {
+        let Some(p) = self.browser.cwd.parent().map(|p| p.to_path_buf()) else { return };
+        let came_from = self.browser.cwd.file_name().map(|n| n.to_string_lossy().to_string());
+        self.browser.cwd = p;
+        self.browser.refresh();
+        self.browser.selected = came_from
+            .and_then(|n| self.browser.entries.iter().position(|(e, _)| *e == n))
+            .unwrap_or(0);
+        self.browser.error = None;
+    }
+    /// Open the highlighted folder, or the typed path while editing.
+    pub fn browser_enter(&mut self) {
+        if self.browser.editing && !self.browser.typed.trim().is_empty() {
+            let p = PathBuf::from(self.browser.typed.trim());
+            if p.is_dir() {
+                self.browser.cwd = std::fs::canonicalize(&p).unwrap_or(p);
+                self.browser.editing = false;
+                self.browser.selected = 0;
+                self.browser.refresh();
+                self.browser.error = None;
+            } else {
+                self.browser.error = Some(format!("not a folder: {}", p.display()));
+            }
+            return;
+        }
+        if let Some((name, true)) = self.browser.entries.get(self.browser.selected).cloned() {
+            if name == ".." {
+                return self.browser_up();
+            }
+            {
+                let next = self.browser.cwd.join(&name);
+                self.browser.cwd = next;
+                self.browser.selected = 0;
+                self.browser.refresh();
+                self.browser.error = None;
+            }
+        }
+    }
+    /// Pin the highlighted folder (or the typed path) and close the browser.
+    pub fn browser_add(&mut self) {
+        let target = if self.browser.editing && !self.browser.typed.trim().is_empty() {
+            PathBuf::from(self.browser.typed.trim())
+        } else if let Some((name, true)) = self.browser.entries.get(self.browser.selected).cloned() {
+            if name == ".." { self.browser.cwd.clone() } else { self.browser.cwd.join(&name) }
+        } else {
+            self.browser.cwd.clone()
+        };
+        match self.add_workspace(target) {
+            Ok(()) => {
+                self.browser.editing = false;
+                self.mode = Mode::Normal;
+                self.focus = Focus::Agents; // next thing you do is launch/inspect agents there
+            }
+            Err(e) => self.browser.error = Some(e.to_string()),
+        }
+    }
+    pub fn browser_start_edit(&mut self) {
+        self.browser.editing = true;
+        self.browser.typed = self.browser.cwd.to_string_lossy().to_string();
+        self.browser.error = None;
+    }
+    pub fn browser_close(&mut self) {
+        self.browser.editing = false;
+        self.mode = Mode::Normal;
+    }
+}
+
+impl Deref for App {
+    type Target = Workspace;
+    fn deref(&self) -> &Workspace {
+        self.active()
+    }
+}
+impl DerefMut for App {
+    fn deref_mut(&mut self) -> &mut Workspace {
+        self.active_mut()
+    }
 }
 
 /// Sort rows (running first, then exited, then observed), newest kept order.
 fn merge_keep(mut rows: Vec<Row>) -> Vec<Row> {
-    rows.sort_by_key(|r| match r.status.as_str() {
-        "running" => 0,
-        "failed" => 1, // surface failures near the top — they need attention
-        "resumable" => 2,
-        "done" => 3,
-        "exited" => 4,
-        _ => 5, // observed sessions last
-    });
+    rows.sort_by_key(Row::rank); // stable: keeps launch order within a rank
     rows
 }
 
-/// argv for a harness's INTERACTIVE REPL. Overridable via
-/// `CREW_INTERACTIVE_CMD_<HARNESS>` (whitespace-split) so tests inject a stub.
-pub fn interactive_argv(harness: &str, model: &str) -> Vec<String> {
-    if let Ok(over) = std::env::var(format!("CREW_INTERACTIVE_CMD_{}", harness.to_uppercase())) {
-        if !over.trim().is_empty() {
-            return over.split_whitespace().map(|s| s.to_string()).collect();
-        }
-    }
-    match harness {
-        "claude" => vec!["claude".into(), "--model".into(), model.into()],
-        "opencode" => vec!["opencode".into()],
-        "cursor" => vec!["cursor-agent".into(), "--model".into(), model.into()],
-        _ => vec!["claude".into()],
-    }
+fn model_args(flag: &str, model: &str) -> Vec<String> {
+    if model.is_empty() { vec![] } else { vec![flag.into(), model.into()] }
 }
 
-/// argv to RESUME a harness in an existing worktree (harness restores the prior
-/// session). Overridable via `CREW_RESUME_CMD_<HARNESS>`.
-pub fn resume_argv(harness: &str, model: &str) -> Vec<String> {
+/// argv for a harness's INTERACTIVE REPL, with the first prompt passed as an
+/// argument (no typing race against the REPL's startup). The
+/// `CREW_INTERACTIVE_CMD_<HARNESS>` override gets the prompt appended the same
+/// way (like `CREW_HEADLESS_CMD_*`).
+pub fn interactive_argv(harness: &str, model: &str, prompt: &str, session: Option<&str>) -> Vec<String> {
+    if let Ok(over) = std::env::var(format!("CREW_INTERACTIVE_CMD_{}", harness.to_uppercase())) {
+        if !over.trim().is_empty() {
+            let mut v: Vec<String> = over.split_whitespace().map(|s| s.to_string()).collect();
+            if !prompt.is_empty() {
+                v.push(prompt.into());
+            }
+            return v;
+        }
+    }
+    let mut v: Vec<String> = match harness {
+        "opencode" => {
+            let mut v = vec!["opencode".into()];
+            v.extend(model_args("-m", model));
+            if !prompt.is_empty() { v.extend(["--prompt".into(), prompt.into()]); }
+            return v;
+        }
+        "cursor" => vec!["cursor-agent".into()],
+        _ => vec!["claude".into()],
+    };
+    v.extend(model_args("--model", model));
+    if let Some(s) = session {
+        v.extend(["--session-id".into(), s.into()]);
+    }
+    if !prompt.is_empty() {
+        v.push(prompt.into());
+    }
+    v
+}
+
+/// argv to RESUME a harness in an existing worktree. Claude resumes its pinned
+/// session id (or starts it fresh under that id if it never got a message);
+/// others continue the cwd's latest session. Overridable via
+/// `CREW_RESUME_CMD_<HARNESS>`.
+pub fn resume_argv(harness: &str, model: &str, session: Option<&str>) -> Vec<String> {
     if let Ok(over) = std::env::var(format!("CREW_RESUME_CMD_{}", harness.to_uppercase())) {
         if !over.trim().is_empty() {
             return over.split_whitespace().map(|s| s.to_string()).collect();
         }
     }
-    match harness {
-        "claude" => vec!["claude".into(), "--continue".into(), "--model".into(), model.into()],
-        "opencode" => vec!["opencode".into(), "--continue".into()],
-        "cursor" => vec!["cursor-agent".into(), "--resume".into()],
-        _ => interactive_argv(harness, model),
+    let mut v: Vec<String> = match (harness, session) {
+        ("claude", Some(s)) if claude_session_exists(s) => vec!["claude".into(), "--resume".into(), s.into()],
+        ("claude", Some(s)) => vec!["claude".into(), "--session-id".into(), s.into()],
+        ("claude", None) => vec!["claude".into(), "--continue".into()],
+        ("opencode", _) => {
+            let mut v = vec!["opencode".into(), "--continue".into()];
+            v.extend(model_args("-m", model));
+            return v;
+        }
+        // ponytail: cursor resumes its latest chat; pin via `cursor-agent create-chat` if agents share a cwd
+        ("cursor", _) => vec!["cursor-agent".into(), "--resume".into()],
+        _ => return interactive_argv(harness, model, "", None),
+    };
+    v.extend(model_args("--model", model));
+    v
+}
+
+/// Whether Claude Code trusts `path`: it or an ancestor has
+/// `hasTrustDialogAccepted` in `~/.claude.json` (trust inherits downward, so a
+/// trusted repo covers its `.crew/worktrees/*`). Read-only; unknown → false.
+pub fn claude_trusts(path: &std::path::Path) -> bool {
+    let Some(home) = std::env::var_os("HOME") else { return false };
+    let Ok(text) = std::fs::read_to_string(PathBuf::from(home).join(".claude.json")) else { return false };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let projects = &v["projects"];
+    path.ancestors().any(|p| projects[p.to_string_lossy().as_ref()]["hasTrustDialogAccepted"] == true)
+}
+
+/// True if Claude Code has a transcript for `id` under `~/.claude/projects/*/`.
+pub fn claude_session_exists(id: &str) -> bool {
+    let Some(home) = std::env::var_os("HOME") else { return false };
+    let file = format!("{}.jsonl", id);
+    std::fs::read_dir(PathBuf::from(home).join(".claude").join("projects"))
+        .map(|rd| rd.flatten().any(|d| d.path().join(&file).is_file()))
+        .unwrap_or(false)
+}
+
+/// Random RFC-4122 v4 UUID (claude `--session-id` requires one).
+pub fn new_uuid() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).is_err() {
+        // ponytail: time+pid fallback, only hit where /dev/urandom is missing
+        let n = now_millis() ^ ((std::process::id() as u128) << 64);
+        b = n.to_le_bytes();
     }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
 /// Read the last 2000 lines of a log file, with friendly fallbacks.
@@ -1364,7 +2194,15 @@ fn worktree_summary(wt: &str) -> (String, bool) {
     let pick = |kw: &str| ss.split(',').find(|s| s.contains(kw))
         .and_then(|s| s.trim().split_whitespace().next()).unwrap_or("0").to_string();
     let (ins, del) = (pick("insertion"), pick("deletion"));
-    (format!("{} file(s) · +{} -{}", files, ins, del), false)
+    let untracked = st.lines().filter(|l| l.starts_with("??")).count();
+    let mut parts = vec![format!("{} file(s)", files)];
+    if ss.trim().is_empty() {
+        parts.push(format!("{} untracked", untracked));
+    } else {
+        parts.push(format!("+{} -{}", ins, del));
+        if untracked > 0 { parts.push(format!("{} untracked", untracked)); }
+    }
+    (parts.join(" · "), false)
 }
 
 /// A worktree with no uncommitted or untracked changes (safe to `git worktree
@@ -1473,7 +2311,12 @@ pub fn slugify(task: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
         .collect();
     let base: String = base.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
-    let base: String = base.chars().take(20).collect();
+    let mut base: String = base.chars().take(32).collect();
+    if base.len() == 32 {
+        if let Some(i) = base.rfind('-').filter(|i| *i >= 12) {
+            base.truncate(i); // don't end mid-word
+        }
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() % 1_000_000)
@@ -1488,6 +2331,167 @@ mod tests {
 
     fn app() -> App {
         App::new(Store::new(PathBuf::from("/tmp/r"), PathBuf::from("/tmp/r/scripts")))
+    }
+
+    fn git_repo(tag: &str) -> PathBuf {
+        use std::process::Command;
+        let repo = std::env::temp_dir().join(format!("crew-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |a: &[&str]| { Command::new("git").arg("-C").arg(&repo).args(a).output().unwrap(); };
+        g(&["init", "-q"]); g(&["config", "user.email", "t@t"]); g(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("seed.txt"), "x").unwrap();
+        g(&["add", "seed.txt"]); g(&["commit", "-qm", "init"]);
+        std::fs::canonicalize(&repo).unwrap()
+    }
+
+    fn rec(id: &str, wt: &str) -> AgentRecord {
+        AgentRecord { id: id.into(), harness: "claude".into(), model: "sonnet".into(),
+            worktree: wt.into(), task: format!("task {id}"), label: None, session_id: None, created: 1.0 }
+    }
+
+    #[test]
+    fn all_view_merges_repos_and_routes_actions() {
+        let d1 = std::env::temp_dir().join(format!("crew-all1-{}", std::process::id()));
+        let d2 = std::env::temp_dir().join(format!("crew-all2-{}", std::process::id()));
+        let mut a = App::new(Store::new(d1.clone(), d1.join("s")));
+        a.workspaces.push(Workspace::new(Store::new(d2.clone(), d2.join("s"))));
+        a.workspaces[0].registry.push(rec("a1", "/tmp"));
+        a.workspaces[1].registry.push(rec("b1", "/tmp"));
+        a.workspaces[1].registry.push(rec("b2", "/tmp"));
+        for w in &mut a.workspaces { w.refresh().unwrap(); }
+        assert!(a.view_all, "opens on the all view");
+        let rows = a.visible_rows();
+        assert_eq!(rows.len(), 3, "rows from every workspace");
+        // walking the merged list moves the action target across workspaces
+        a.sel_top();
+        let first = a.selected_row().unwrap().id.clone();
+        a.sel_bottom();
+        let last = a.visible_rows().last().unwrap().clone();
+        assert_eq!(a.active, last.ws, "active follows the selected row");
+        assert_eq!(a.selected_row().unwrap().id, last.id);
+        assert_ne!(first, last.id);
+        // marks span workspaces; a bulk remove hits each owner
+        a.mark_all_visible();
+        assert_eq!(a.marked_total(), 3);
+        a.remove_selected();
+        assert!(a.workspaces.iter().all(|w| w.registry.is_empty()), "bulk remove across repos");
+        // narrowing to one workspace shows only its rows
+        a.workspaces[1].registry.push(rec("b3", "/tmp"));
+        a.workspaces[1].refresh().unwrap();
+        a.ws_cursor = 1; // workspaces[0]
+        a.select_workspace();
+        assert!(!a.view_all);
+        assert!(a.visible_rows().is_empty());
+        let _ = (std::fs::remove_dir_all(&d1), std::fs::remove_dir_all(&d2));
+    }
+
+    #[test]
+    fn form_follows_repo_picker_and_plain_folder_has_no_worktree() {
+        let repo = git_repo("form");
+        let plain = std::env::temp_dir().join(format!("crew-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut a = App::new(Store::new(repo.clone(), repo.join("s")));
+        a.workspaces.push(Workspace::new(Store::new(plain.clone(), plain.join("s"))));
+        a.cwd_ws = Some(0);
+        a.open_new_agent();
+        assert_eq!(a.new_form.ws_idx, 0, "defaults to the launch folder's repo");
+        a.new_form.task.insert_str("keep me");
+        a.cycle_form_repo(1);
+        assert_eq!((a.active, a.new_form.ws_idx, a.mode), (1, 1, Mode::NewAgent));
+        assert_eq!(a.new_form.task_text(), "keep me", "form moves with the repo");
+        assert!(!a.new_form.worktree_new, "plain folder can't host a worktree");
+        assert_eq!(a.workspaces[0].mode, Mode::Normal);
+        let _ = (std::fs::remove_dir_all(&repo), std::fs::remove_dir_all(&plain));
+    }
+
+    #[test]
+    fn adopt_cwd_pins_without_switching_view() {
+        let r1 = git_repo("cwd1");
+        let r2 = git_repo("cwd2");
+        let mut a = App::new(Store::new(r1.clone(), r1.join("s")));
+        assert!(a.adopt_cwd(&r2, None));
+        assert_eq!(a.workspaces.len(), 2);
+        assert_eq!(a.cwd_ws, Some(1));
+        assert!(a.view_all && a.active == 0, "view unchanged");
+        assert!(!a.adopt_cwd(&r2, None)); // already pinned → no duplicate
+        assert_eq!(a.workspaces.len(), 2);
+        let _ = (std::fs::remove_dir_all(&r1), std::fs::remove_dir_all(&r2));
+    }
+
+    #[test]
+    fn setup_script_runs_in_new_worktree_before_harness() {
+        let repo = git_repo("setup");
+        std::fs::create_dir_all(repo.join(".crew")).unwrap();
+        std::fs::write(repo.join(".crew/setup"), "touch setup_ran\n").unwrap();
+        std::env::set_var("CREW_INTERACTIVE_CMD_OPENCODE", "sh -c cat");
+        let mut a = App::new(Store::new(repo.clone(), repo.join("s")));
+        a.open_new_agent();
+        a.new_form.harness_idx = 1; // opencode (stubbed)
+        a.new_form.worktree_new = true;
+        a.new_form.task.insert_str("setup check");
+        a.spawn_from_form();
+        assert_eq!(a.mode, Mode::Terminal, "{:?}", a.new_form.error);
+        let wt = a.agents[0].worktree.clone();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(std::path::Path::new(&wt).join("setup_ran").exists(), "setup didn't run in {wt}");
+        assert!(a.agents[0].is_alive(), "harness exec'd after setup");
+        a.detach_all(); // pty agents: detach == kill
+        std::env::remove_var("CREW_INTERACTIVE_CMD_OPENCODE");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn folder_picker_opens_beside_repo_and_up_keeps_place() {
+        let repo = git_repo("pick");
+        let mut a = App::new(Store::new(repo.clone(), repo.join("s")));
+        a.open_browser();
+        assert_eq!(a.browser.cwd, repo.parent().unwrap(), "opens in the repo's parent");
+        let name = repo.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(a.browser.entries[a.browser.selected].0, name, "current repo highlighted");
+        a.browser_enter(); // into the repo
+        a.browser_up();    // and back out
+        assert_eq!(a.browser.entries[a.browser.selected].0, name, "up keeps the folder we left");
+        // pinning an already-pinned repo just goes there
+        a.browser_add();
+        assert_eq!(a.workspaces.len(), 1);
+        assert_eq!(a.mode, Mode::Normal);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn unpin_refuses_all_row_and_live_workspaces() {
+        let d = std::env::temp_dir().join(format!("crew-unpin-{}", std::process::id()));
+        let mut a = App::new(Store::new(d.clone(), d.join("s")));
+        a.workspaces.push(Workspace::new(Store::new(d.join("b"), d.join("s"))));
+        a.ws_cursor = 0;
+        a.remove_workspace_at_selected();
+        assert_eq!(a.workspaces.len(), 2);
+        let argv = vec!["cat".to_string()];
+        let p = AgentProc::spawn("x".into(), "stub".into(), "m".into(), String::new(),
+            std::env::temp_dir().to_string_lossy().into(), &argv, 24, 80).unwrap();
+        a.workspaces[1].agents.push(p);
+        a.remove_workspace(1);
+        assert_eq!(a.workspaces.len(), 2, "live agents block unpinning");
+        a.detach_all(); // pty agents: detach == kill
+    }
+
+    #[test]
+    fn claude_is_pinned_to_a_session_and_prompt_is_an_arg() {
+        let id = new_uuid();
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4", "v4 uuid: {id}");
+        let argv = interactive_argv("claude", "sonnet", "fix it", Some(&id));
+        assert!(argv.windows(2).any(|w| w[0] == "--session-id" && w[1] == id));
+        assert_eq!(argv.last().unwrap(), "fix it");
+        // never-messaged session → reopened fresh under the same id, not --continue
+        let r = resume_argv("claude", "sonnet", Some(&id));
+        assert!(r.windows(2).any(|w| w[0] == "--session-id" && w[1] == id), "{r:?}");
+        assert!(!r.contains(&"--continue".to_string()));
+        // legacy records without a session id fall back to --continue
+        assert!(resume_argv("claude", "", None).contains(&"--continue".to_string()));
+        let o = interactive_argv("opencode", "m/x", "hi", None);
+        assert!(o.windows(2).any(|w| w[0] == "--prompt" && w[1] == "hi"));
     }
 
     #[test]
@@ -1615,7 +2619,7 @@ mod tests {
         assert!(std::path::Path::new(&wt).is_dir());
         a.registry.push(AgentRecord {
             id: "p".into(), harness: "claude".into(), model: "m".into(),
-            worktree: wt.clone(), task: "t".into(), label: None,
+            worktree: wt.clone(), task: "t".into(), label: None, session_id: None, created: 0.0,
         });
         a.refresh().unwrap();
         a.selected = a.rows.iter().position(|r| r.id == "p").unwrap();
@@ -1630,7 +2634,7 @@ mod tests {
         let mut a = app();
         a.registry.push(AgentRecord {
             id: "lbl1".into(), harness: "claude".into(), model: "sonnet".into(),
-            worktree: "/tmp/wt".into(), task: "do the thing".into(), label: None,
+            worktree: "/tmp/wt".into(), task: "do the thing".into(), label: None, session_id: None, created: 0.0,
         });
         a.refresh().unwrap();
         a.selected = a.rows.iter().position(|r| r.id == "lbl1").unwrap();

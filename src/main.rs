@@ -13,12 +13,14 @@ mod app;
 mod pty;
 mod store;
 mod ui;
+mod workspace;
 
 use anyhow::Result;
-use app::{App, Mode};
+use app::{App, Focus, Mode};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
@@ -60,24 +62,31 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--doctor") {
         return doctor(&args);
     }
-    let scripts_override = arg_value(&args, "--scripts");
+    let scripts_override = arg_value(&args, "--scripts").map(PathBuf::from);
 
-    let cwd = std::env::current_dir()?;
-    // crew is repo-scoped: worktrees, branches, status all need a git repo.
-    let interactive = !args.iter().any(|a| a == "--dump" || a == "--snapshot");
-    if interactive && !store::is_git_repo(&cwd) {
-        eprintln!("crew: not inside a git repository (cd into one, or `git init`)");
-        std::process::exit(1);
+    // Workspaces are pinned in a global config; first run pins the cwd. Any
+    // folder can be pinned — a git repo gets worktree isolation, a plain folder
+    // still gets agent management.
+    let cfg = workspace::load_global();
+    // where agents live: CREW_BACKEND overrides the saved setting (auto|tmux|pty)
+    let be = std::env::var("CREW_BACKEND").unwrap_or_else(|_| cfg.backend.clone());
+    pty::set_backend(pty::resolve_backend(&be));
+    let mut app = if cfg.workspaces.is_empty() {
+        let cwd = std::env::current_dir()?;
+        let a = App::new(workspace::store_for_path(&cwd, scripts_override.as_deref()));
+        a.save_global();
+        a
+    } else {
+        App::from_config(&cfg, scripts_override.as_deref())
+    };
+    // the launch folder becomes the default repo for new agents (pinned if
+    // new) — but crew always opens on "all": you see the whole fleet first
+    if app.adopt_cwd(&std::env::current_dir()?, scripts_override.as_deref()) {
+        app.save_global();
     }
-    let repo_root = store::git_toplevel(&cwd);
-    let scripts_dir = scripts_override
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("CREW_SCRIPTS").ok().map(PathBuf::from))
-        .unwrap_or_else(|| repo_root.join("scripts"));
-
-    let st = store::Store::new(repo_root, scripts_dir);
-    let mut app = App::new(st);
-    app.refresh()?;
+    for w in &mut app.workspaces {
+        let _ = w.refresh();
+    }
 
     if args.iter().any(|a| a == "--dump") {
         dump_table(&app);
@@ -189,6 +198,11 @@ fn doctor(args: &[String]) -> Result<()> {
     println!("  {} git installed", mark(app::on_path("git")));
     println!("  {} inside a git repository", mark(store::is_git_repo(&cwd)));
     println!("  {} gh (GitHub CLI, for push→PR / open)", mark(app::gh_available()));
+    let setting = std::env::var("CREW_BACKEND").unwrap_or_else(|_| workspace::load_global().backend);
+    let be = pty::resolve_backend(&setting);
+    println!("  {} tmux — agent backend: {} (setting: {})", mark(app::on_path("tmux")),
+        if be == pty::Backend::Tmux { "tmux, agents survive quitting crew" } else { "pty, agents stop when crew exits" },
+        if setting.is_empty() { "auto" } else { &setting });
     println!("\n  harness CLIs:");
     for h in app::HARNESSES {
         println!("    {} {:<9} ({})", mark(app::harness_installed(h)), h, app::harness_bin(h));
@@ -228,10 +242,17 @@ fn headless_argv(harness: &str, model: &str, task: &str) -> Vec<String> {
 }
 
 fn dump_table(app: &App) {
-    println!("crew agents for {} — {} rows", app.store.repo_root.display(), app.rows.len());
-    for r in &app.rows {
-        let kind = if r.interactive { "agent" } else { "session" };
-        println!("{:<7} {:<9} {:<8} {}", kind, r.harness, r.status, r.task);
+    use std::io::Write;
+    let mut out = io::stdout().lock();
+    let rows = app.visible_rows();
+    let _ = writeln!(out, "crew agents across {} workspace(s) — {} rows", app.workspaces.len(), rows.len());
+    for r in &rows {
+        let kind = if r.interactive { "agent" } else if r.kind == agent::Kind::Observed { "session" } else { "agent" };
+        let repo = app.workspaces[r.ws].name();
+        // a closed pipe (`| head`) just ends the listing — never panic
+        if writeln!(out, "{:<7} {:<12} {:<9} {:<9} {}", kind, repo, r.harness, r.status_label(), r.task).is_err() {
+            return;
+        }
     }
 }
 
@@ -240,26 +261,30 @@ fn snapshot(app: &App) {
     let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
     term.draw(|f| ui::draw(f, app)).unwrap();
     let buf = term.backend().buffer().clone();
+    use std::io::Write;
+    let mut out = io::stdout().lock();
     for y in 0..buf.area.height {
         let mut line = String::new();
         for x in 0..buf.area.width {
             line.push_str(buf[(x, y)].symbol());
         }
-        println!("{}", line.trim_end());
+        if writeln!(out, "{}", line.trim_end()).is_err() {
+            return; // reader went away (`| head`)
+        }
     }
 }
 
 fn run_tui(app: &mut App) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = event_loop(app, &mut terminal);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     terminal.show_cursor()?;
     res
 }
@@ -294,23 +319,66 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
                         handle_key(app, key);
                     }
                 }
-                Event::Mouse(m) if app.mode == Mode::Normal => match m.kind {
-                    MouseEventKind::ScrollDown => app.move_sel(1),
-                    MouseEventKind::ScrollUp => app.move_sel(-1),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        // list occupies the left ~34%; items start at y=2 (header
-                        // row + top border). Click selects that row.
-                        let w = terminal.size().map(|s| s.width).unwrap_or(80);
-                        let left_w = w * 34 / 100;
-                        if m.column < left_w && m.row >= 2 {
-                            let idx = (m.row - 2) as usize;
-                            if idx < app.rows.len() {
-                                app.selected = idx;
+                Event::Paste(text) => handle_paste(app, &text),
+                Event::Mouse(m) if app.mode == Mode::Terminal => {
+                    // wheel over the chat scrolls its history; other mouse
+                    // input stays out of the agent's way
+                    let w = terminal.size().map(|s| s.width).unwrap_or(80);
+                    match m.kind {
+                        MouseEventKind::ScrollUp => wheel_chat(app, true, m.column, m.row, w),
+                        MouseEventKind::ScrollDown => wheel_chat(app, false, m.column, m.row, w),
+                        _ => {}
+                    }
+                }
+                Event::Mouse(m) if app.mode == Mode::Normal => {
+                    let w = terminal.size().map(|s| s.width).unwrap_or(80);
+                    // zoomed: the detail pane owns the whole width
+                    let (ws_w, agents_w) = if app.zoom { (0, 0) } else {
+                        let (a, b) = ui::pane_widths(app, w);
+                        (a, a + b)
+                    };
+                    match m.kind {
+                        MouseEventKind::ScrollDown => {
+                            if m.column < ws_w { app.ws_move(1); }
+                            else if m.column < agents_w { app.move_sel(1); }
+                            else { wheel_chat(app, false, m.column, m.row, w); }
+                        }
+                        MouseEventKind::ScrollUp => {
+                            if m.column < ws_w { app.ws_move(-1); }
+                            else if m.column < agents_w { app.move_sel(-1); }
+                            else { wheel_chat(app, true, m.column, m.row, w); }
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // items start at y=2 (header row + panel top border);
+                            // ratatui scrolls the list just enough to show the
+                            // selection, so add that offset back.
+                            let h = terminal.size().map(|s| s.height).unwrap_or(24);
+                            let visible = h.saturating_sub(4).max(1) as usize;
+                            if m.column >= agents_w {
+                                // click the terminal pane → chat with that agent
+                                if app.selected_row().map(|r| r.is_live()).unwrap_or(false) {
+                                    app.mode = Mode::Terminal;
+                                }
+                            } else if m.row >= 2 {
+                                let row = (m.row - 2) as usize;
+                                if m.column < ws_w {
+                                    let idx = row + app.ws_cursor.saturating_sub(visible - 1);
+                                    if idx <= app.workspaces.len() {
+                                        app.ws_cursor = idx;
+                                        app.focus = Focus::Workspaces;
+                                        app.select_workspace();
+                                    }
+                                } else {
+                                    app.focus = Focus::Agents;
+                                    let rows = app.visible_rows();
+                                    let idx = row + app.visible_index(&rows).saturating_sub(visible - 1);
+                                    app.select_index(idx);
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                },
+                }
                 _ => {}
             }
         }
@@ -324,7 +392,10 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
             if app.mode == Mode::Log {
                 app.tick_log(); // live-follow the open log (tail -f)
             } else {
-                let _ = app.refresh();
+                app.tick();
+            }
+            if let Some(msg) = app.take_alert() {
+                notify(terminal, &msg);
             }
             last_refresh = Instant::now();
         }
@@ -341,6 +412,7 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
 
         if app.should_quit {
             app.save_ui_prefs(); // remember view toggles for next run
+            app.detach_all(); // tmux agents keep running; pty agents are stopped (resumable)
             return Ok(());
         }
     }
@@ -354,23 +426,32 @@ fn run_suspended(terminal: &mut Term, cwd: &str, argv: &[String]) -> Result<()> 
         return Ok(());
     }
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
     let _ = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(cwd)
         .status();
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     terminal.clear()?;
     Ok(())
 }
 
-/// In Terminal mode every key is forwarded to the agent's PTY, except Ctrl-o
-/// which leaves the embedded terminal and returns to the dashboard.
+/// In Terminal mode every key is forwarded to the agent's PTY, except the
+/// detach key, Ctrl-q (Ctrl-o belongs to Claude Code's transcript toggle).
 fn handle_terminal_key(app: &mut App, key: KeyEvent) {
-    if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.mode = Mode::Normal;
         return;
+    }
+    // Shift-PgUp/PgDn page through the chat's history (not sent to the agent)
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        let page = app.term_size.1.max(4) as i64 - 2;
+        match key.code {
+            KeyCode::PageUp => return scroll_chat(app, page),
+            KeyCode::PageDown => return scroll_chat(app, -page),
+            _ => {}
+        }
     }
     let bytes = key_to_bytes(key);
     if !bytes.is_empty() {
@@ -378,38 +459,148 @@ fn handle_terminal_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Vim scroll keys shared by every list/viewer: Some(delta) for j/k, ctrl-d/u
+/// (half page), ctrl-f/b + PgDn/PgUp (page), g/G (ends). `page` = rows visible.
+fn vim_delta(key: &KeyEvent, page: i64) -> Option<i64> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    Some(match key.code {
+        KeyCode::Char('d') if ctrl => page / 2,
+        KeyCode::Char('u') if ctrl => -page / 2,
+        KeyCode::Char('f') if ctrl => page,
+        KeyCode::Char('b') if ctrl => -page,
+        KeyCode::Char('e') if ctrl => 1,
+        KeyCode::Char('y') if ctrl => -1,
+        _ if ctrl => return None,
+        KeyCode::Char('j') | KeyCode::Down => 1,
+        KeyCode::Char('k') | KeyCode::Up => -1,
+        KeyCode::PageDown => page,
+        KeyCode::PageUp => -page,
+        KeyCode::Char('g') | KeyCode::Home => i64::MIN / 2,
+        KeyCode::Char('G') | KeyCode::End => i64::MAX / 2,
+        _ => return None,
+    })
+}
+
+fn request_quit(app: &mut App) {
+    // tmux-backed agents survive quitting — only confirm if some would die
+    if app.live_mortal() > 0 {
+        app.mode = Mode::ConfirmQuit;
+    } else {
+        app.should_quit = true;
+    }
+}
+
+/// Scroll the selected agent's chat history (>0 = older).
+fn scroll_chat(app: &mut App, lines: i64) {
+    if let Some(p) = app.selected_proc() {
+        p.scroll(lines);
+    }
+}
+
+/// Mouse wheel at screen (col,row) over the chat pane → the agent, translated
+/// to pane-relative cells (pane interior starts below header + border).
+fn wheel_chat(app: &mut App, up: bool, col: u16, row: u16, width: u16) {
+    let x0 = if app.zoom { 1 } else { let (a, b) = ui::pane_widths(app, width); a + b + 1 };
+    if let Some(p) = app.selected_proc() {
+        p.wheel(up, col.saturating_sub(x0), row.saturating_sub(2));
+    }
+}
+
+/// Ring the bell and post a desktop notification (OSC 9: iTerm2, kitty,
+/// WezTerm, Ghostty; ignored elsewhere) — so a waiting/finished agent reaches
+/// you even when crew isn't the window you're looking at.
+fn notify(terminal: &mut Term, msg: &str) {
+    use std::io::Write;
+    let clean: String = msg.chars().filter(|c| !c.is_control()).collect();
+    let _ = write!(terminal.backend_mut(), "\x1b]9;crew: {}\x07\x07", clean);
+    let _ = terminal.backend_mut().flush();
+}
+
+/// Bracketed paste arrives as one string. Route it as a unit so newlines never
+/// act as Enter: into the agent (wrapped for it), the task editor, or the
+/// one-line inputs (first line only). Pasting on the dashboard starts a new
+/// agent with the text as its task.
+fn handle_paste(app: &mut App, text: &str) {
+    let first = text.lines().next().unwrap_or("").to_string();
+    match app.mode {
+        Mode::Terminal => {
+            if let Some(p) = app.selected_proc() {
+                p.paste(text);
+            }
+        }
+        Mode::NewAgent => {
+            if let Some(buf) = app.new_form.image_input.as_mut() {
+                buf.push_str(first.trim());
+            } else {
+                app.new_form.field = app::FIELD_TASK;
+                app.new_form.task.insert_str(text);
+            }
+        }
+        Mode::Normal => {
+            app.open_new_agent();
+            app.new_form.task.insert_str(text);
+        }
+        Mode::Filter => { app.filter_text.push_str(&first); app.apply_filter(); }
+        Mode::Rename => app.rename_buf.push_str(&first),
+        Mode::BrowseFolder => {
+            app.browser.editing = true;
+            app.browser.typed = first.trim().to_string();
+        }
+        Mode::Diff | Mode::Log if app.find_input => app.find_query.push_str(&first),
+        _ => {}
+    }
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     let code = key.code;
-    // Ctrl-d / Ctrl-u half-page the list (checked before plain-letter binds).
-    if app.mode == Mode::Normal && key.modifiers.contains(KeyModifiers::CONTROL) {
-        match code {
-            KeyCode::Char('d') => { app.move_sel(8); return; }
-            KeyCode::Char('u') => { app.move_sel(-8); return; }
-            _ => {}
-        }
-    }
+    let page = app.term_size.1.max(4) as i64;
     match app.mode {
-        Mode::Normal => match code {
-            KeyCode::Char('q') => {
-                if app.agents.iter_mut().any(|a| a.is_alive()) {
-                    app.mode = Mode::ConfirmQuit;
-                } else {
-                    app.should_quit = true;
+        Mode::Normal => {
+            // Pane focus is vim-style: h/← = workspaces, l/→ = drill in.
+            if app.focus == Focus::Workspaces {
+                if let Some(d) = vim_delta(&key, page) {
+                    match d {
+                        d if d <= i64::MIN / 2 => app.ws_top(),
+                        d if d >= i64::MAX / 2 => app.ws_bottom(),
+                        d => app.ws_move(d.signum()),
+                    }
+                    return;
+                }
+                match code {
+                    KeyCode::Tab | KeyCode::BackTab => { app.toggle_focus(); return; }
+                    KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                        app.select_workspace();
+                        app.focus = Focus::Agents;
+                        return;
+                    }
+                    KeyCode::Char('h') | KeyCode::Left => return,
+                    KeyCode::Char('x') => { app.remove_workspace_at_selected(); return; }
+                    KeyCode::Char('w') => { app.open_browser(); return; }
+                    // anything else is an agent key: hand focus back to the list
+                    // and run it there — never swallow a key silently
+                    _ => app.focus = Focus::Agents,
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => app.move_sel(1),
-            KeyCode::Char('k') | KeyCode::Up => app.move_sel(-1),
-            KeyCode::Char('g') | KeyCode::Home => app.sel_top(),
-            KeyCode::Char('G') | KeyCode::End => app.sel_bottom(),
-            KeyCode::PageDown => app.move_sel(10),
-            KeyCode::PageUp => app.move_sel(-10),
+            if let Some(d) = vim_delta(&key, page) {
+                match d {
+                    d if d <= i64::MIN / 2 => app.sel_top(),
+                    d if d >= i64::MAX / 2 => app.sel_bottom(),
+                    d => app.move_sel(d),
+                }
+                return;
+            }
+            match code {
+            KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
+            KeyCode::Char('h') | KeyCode::Left => app.focus = Focus::Workspaces,
+            KeyCode::Char('q') => request_quit(app),
             KeyCode::Char(']') => app.jump_failed(1),
             KeyCode::Char('[') => app.jump_failed(-1),
             KeyCode::Char('y') => app.yank_worktree(),
-            KeyCode::Char('r') => { let _ = app.refresh(); }
+            KeyCode::Char('w') => app.open_browser(),
+            KeyCode::Char('a') => { app.ws_cursor = 0; app.view_all = true; }
             KeyCode::Char('n') => app.open_new_agent(),
             KeyCode::Char('s') => {
-                let has_live = !app.marked.is_empty()
+                let has_live = app.marked_total() > 0
                     || app.selected_row().map(|r| r.interactive).unwrap_or(false);
                 if has_live {
                     app.mode = Mode::ConfirmStop;
@@ -420,26 +611,31 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char(' ') => app.toggle_mark(),
             KeyCode::Char('A') => app.mark_all_visible(),
             KeyCode::Esc => {
-                if !app.marked.is_empty() {
+                // peel one layer per press: marks → search → category
+                if app.marked_total() > 0 {
                     app.clear_marks();
+                } else if !app.filter_text.is_empty() {
+                    app.filter_text.clear();
+                    app.apply_filter();
                 } else if app.category != app::Category::All {
                     app.set_category(app::Category::All);
                 }
             }
             KeyCode::Char('x') => {
-                if app.marked.is_empty() { app.remove_selected(); }
-                else { app.mode = Mode::ConfirmRemove; }
+                if app.selected_row().is_some() || app.marked_total() > 0 {
+                    app.mode = Mode::ConfirmRemove;
+                }
             }
-            KeyCode::Char('L') => app.open_rename(),
+            KeyCode::Char('r') => app.open_rename(),
             KeyCode::Char('D') => app.duplicate_selected(),
             KeyCode::Char('S') => {
-                if app.agents.iter_mut().any(|a| a.is_alive()) {
+                if app.visible_rows().iter().any(|r| r.is_live()) {
                     app.mode = Mode::ConfirmStopAll;
                 } else {
                     app.status_msg = "no running agents".into();
                 }
             }
-            KeyCode::Char('c') => app.clear_finished(),
+            KeyCode::Char('c') => app.mode = Mode::ConfirmClear,
             KeyCode::Char('R') => app.open_retry(),
             KeyCode::Char('P') => app.open_push(),
             KeyCode::Char('o') => app.show_worktree(),
@@ -449,8 +645,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('e') => app.open_editor(),
             KeyCode::Char('!') => app.open_shell(),
             KeyCode::Char('d') => app.show_diff(),
-            KeyCode::Char('l') => app.show_log(),
-            KeyCode::Char('h') => { app.show_observed = !app.show_observed; let _ = app.refresh(); }
+            KeyCode::Char('L') => app.show_log(),
+            KeyCode::Char('H') => { let on = !app.show_observed; app.set_show_observed(on); }
+            KeyCode::Char('z') => app.zoom = !app.zoom,
             KeyCode::Char('1') => app.set_category(app::Category::All),
             KeyCode::Char('2') => app.set_category(app::Category::Running),
             KeyCode::Char('3') => app.set_category(app::Category::Agents),
@@ -459,13 +656,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char(',') => app.open_settings(),
             KeyCode::Char('/') => app.mode = Mode::Filter,
             KeyCode::Char('?') => { app.help_scroll = 0; app.mode = Mode::Help; }
-            KeyCode::Enter => app.open_selected(),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.open_selected(),
             _ => {}
-        },
-        Mode::Help => match code {
-            KeyCode::Char('j') | KeyCode::Down => app.help_scroll = app.help_scroll.saturating_add(1),
-            KeyCode::Char('k') | KeyCode::Up => app.help_scroll = app.help_scroll.saturating_sub(1),
-            _ => app.mode = Mode::Normal,
+            }
+        }
+        Mode::Help => match vim_delta(&key, page) {
+            Some(d) => app.help_scroll = (app.help_scroll as i64 + d).clamp(0, 200) as u16,
+            None => app.mode = Mode::Normal,
         },
         Mode::Diff | Mode::Log => handle_viewer_key(app, key),
         Mode::Retry => match code {
@@ -492,7 +689,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         },
         Mode::ConfirmPush => match code {
             KeyCode::Char('y') | KeyCode::Enter => app.confirm_push(),
-            KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::Normal,
+            KeyCode::Char('n') | KeyCode::Esc => app.cancel_push(),
             _ => {}
         },
         Mode::Settings => match code {
@@ -506,6 +703,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         },
         Mode::ConfirmRemove => match code {
             KeyCode::Char('y') => { app.remove_selected(); app.mode = Mode::Normal; }
+            KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::Normal,
+            _ => {}
+        },
+        Mode::ConfirmClear => match code {
+            KeyCode::Char('y') => { app.clear_finished(); app.mode = Mode::Normal; }
             KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::Normal,
             _ => {}
         },
@@ -529,7 +731,38 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         Mode::NewAgent => handle_new_agent_key(app, key),
+        Mode::BrowseFolder => handle_browser_key(app, key),
         Mode::Terminal => {}
+    }
+}
+
+/// Keys for the folder browser (`Mode::BrowseFolder`). While editing a typed
+/// path every printable key goes to the buffer; otherwise j/k navigate and
+/// `a` pins.
+fn handle_browser_key(app: &mut App, key: KeyEvent) {
+    if app.browser.editing {
+        match key.code {
+            KeyCode::Enter => app.browser_enter(),
+            KeyCode::Esc => app.browser.editing = false,
+            KeyCode::Backspace => { app.browser.typed.pop(); }
+            KeyCode::Char(c) => app.browser.typed.push(c),
+            _ => {}
+        }
+        return;
+    }
+    if let Some(d) = vim_delta(&key, 10) {
+        let n = app.browser.entries.len().max(1) as i64;
+        let to = (app.browser.selected as i64 + d).clamp(0, n - 1);
+        app.browser.selected = to as usize;
+        return;
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.browser_enter(),
+        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => app.browser_up(),
+        KeyCode::Char('a') => app.browser_add(),
+        KeyCode::Char('/') => app.browser_start_edit(),
+        KeyCode::Esc | KeyCode::Char('q') => app.browser_close(),
+        _ => {}
     }
 }
 
@@ -547,13 +780,12 @@ fn handle_viewer_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    if let Some(d) = vim_delta(&key, 20) {
+        app.scroll_viewer(d);
+        return;
+    }
     match code {
-        KeyCode::Char('j') | KeyCode::Down => app.scroll_viewer(1),
-        KeyCode::Char('k') | KeyCode::Up => app.scroll_viewer(-1),
-        KeyCode::PageDown | KeyCode::Char(' ') => app.scroll_viewer(20),
-        KeyCode::PageUp => app.scroll_viewer(-20),
-        KeyCode::Char('g') | KeyCode::Home => app.scroll_viewer(i64::MIN),
-        KeyCode::Char('G') | KeyCode::End => app.scroll_viewer(i64::MAX),
+        KeyCode::Char(' ') => app.scroll_viewer(20),
         KeyCode::Char('/') => { app.find_input = true; app.find_query.clear(); }
         KeyCode::Char('n') => app.find_next(1),
         KeyCode::Char('N') => app.find_next(-1),
@@ -568,14 +800,38 @@ fn handle_viewer_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_new_agent_key(app: &mut App, key: KeyEvent) {
-    use app::{FIELD_HARNESS, FIELD_IMAGES, FIELD_MODEL, FIELD_TASK, FIELD_WORKFLOW, FIELD_WORKTREE, FIELD_COUNT};
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+/// Next visible form field in direction `d` (the workflow picker is hidden
+/// without the engine — its plan/build workflows need the engine's skills).
+fn next_field(field: usize, d: i64, has_engine: bool) -> usize {
+    use app::{FIELD_COUNT, FIELD_WORKFLOW};
+    let n = FIELD_COUNT as i64;
+    let mut f = field as i64;
+    loop {
+        f = (f + d).rem_euclid(n);
+        if has_engine || f as usize != FIELD_WORKFLOW {
+            return f as usize;
+        }
+    }
+}
 
-    // Ctrl-S launches from any field (task uses Enter for newlines).
-    if ctrl && key.code == KeyCode::Char('s') {
-        app.spawn_from_form();
-        return;
+fn handle_new_agent_key(app: &mut App, key: KeyEvent) {
+    use app::{FIELD_HARNESS, FIELD_IMAGES, FIELD_MODEL, FIELD_REPO, FIELD_TASK, FIELD_WORKFLOW, FIELD_WORKTREE};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+    let engine = app.store.has_engine();
+
+    if app.new_form.image_input.is_none() {
+        // Enter launches (chat-app convention); Alt/Shift-Enter or Ctrl-j add
+        // a newline in the task. Ctrl-S still launches too.
+        let newline = (key.code == KeyCode::Enter && alt) || (ctrl && key.code == KeyCode::Char('j'));
+        if newline && app.new_form.field == FIELD_TASK {
+            app.new_form.task.insert_newline();
+            return;
+        }
+        if (key.code == KeyCode::Enter && !alt) || (ctrl && key.code == KeyCode::Char('s')) {
+            app.spawn_from_form();
+            return;
+        }
     }
     match key.code {
         KeyCode::Esc => {
@@ -590,21 +846,20 @@ fn handle_new_agent_key(app: &mut App, key: KeyEvent) {
             }
             return;
         }
-        KeyCode::Tab => { app.new_form.field = (app.new_form.field + 1) % FIELD_COUNT; return; }
-        KeyCode::BackTab => { app.new_form.field = (app.new_form.field + FIELD_COUNT - 1) % FIELD_COUNT; return; }
+        KeyCode::Tab => { app.new_form.field = next_field(app.new_form.field, 1, engine); return; }
+        KeyCode::BackTab => { app.new_form.field = next_field(app.new_form.field, -1, engine); return; }
         _ => {}
     }
 
-    let f = &mut app.new_form;
     // image-path capture sub-mode
-    if let Some(buf) = f.image_input.as_mut() {
+    if let Some(buf) = app.new_form.image_input.as_mut() {
         match key.code {
             KeyCode::Enter => {
                 let path = buf.trim().to_string();
+                let f = &mut app.new_form;
                 if !path.is_empty() { f.images.push(path); }
                 f.image_input = None;
             }
-            KeyCode::Esc => f.image_input = None,
             KeyCode::Backspace => { buf.pop(); }
             KeyCode::Char(c) => buf.push(c),
             _ => {}
@@ -612,31 +867,51 @@ fn handle_new_agent_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // a printable key that isn't a picker key, typed on a picker field, was
+    // meant for the task: jump back and type it there (h/l/j/k/space/a/d stay keys)
+    if app.new_form.field != FIELD_TASK {
+        if let KeyCode::Char(c) = key.code {
+            let picker_key = matches!(c, 'h' | 'l' | 'j' | 'k' | ' ')
+                || (app.new_form.field == FIELD_IMAGES && matches!(c, 'a' | 'd'));
+            if !picker_key && !ctrl {
+                app.new_form.field = FIELD_TASK;
+                app.new_form.task.input(key);
+                return;
+            }
+        }
+    }
+    // on picker fields, j/k (↑/↓) move between fields like any vim list
+    if app.new_form.field != FIELD_TASK {
+        let d = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => 1,
+            KeyCode::Char('k') | KeyCode::Up => -1,
+            _ => 0,
+        };
+        if d != 0 {
+            app.new_form.field = next_field(app.new_form.field, d, engine);
+            return;
+        }
+    }
+    let dir = match key.code {
+        KeyCode::Left | KeyCode::Char('h') => -1,
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => 1,
+        _ => 0,
+    };
+    if app.new_form.field == FIELD_REPO {
+        if dir != 0 { app.cycle_form_repo(dir); }
+        return;
+    }
+    let is_git = app.is_git;
+    let f = &mut app.new_form;
     match f.field {
         FIELD_TASK => { f.task.input(key); }
-        FIELD_WORKFLOW => match key.code {
-            KeyCode::Left | KeyCode::Char('h') => f.cycle_workflow(-1),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => f.cycle_workflow(1),
-            _ => {}
-        },
-        FIELD_HARNESS => match key.code {
-            KeyCode::Left | KeyCode::Char('h') => f.cycle_harness(-1),
-            KeyCode::Right | KeyCode::Char('l') => f.cycle_harness(1),
-            _ => {}
-        },
-        FIELD_MODEL => match key.code {
-            KeyCode::Left | KeyCode::Char('h') => f.cycle_model(-1),
-            KeyCode::Right | KeyCode::Char('l') => f.cycle_model(1),
-            _ => {}
-        },
-        FIELD_WORKTREE => match key.code {
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Char('h') | KeyCode::Char('l') => {
-                f.worktree_new = !f.worktree_new;
-            }
-            _ => {}
-        },
+        FIELD_WORKFLOW if dir != 0 => f.cycle_workflow(dir),
+        FIELD_HARNESS if dir != 0 => f.cycle_harness(dir),
+        FIELD_MODEL if dir != 0 => f.cycle_model(dir),
+        // a plain folder can't host a git worktree — the picker stays put
+        FIELD_WORKTREE if dir != 0 && is_git => f.worktree_new = !f.worktree_new,
         FIELD_IMAGES => match key.code {
-            KeyCode::Char('a') | KeyCode::Enter => f.image_input = Some(String::new()),
+            KeyCode::Char('a') => f.image_input = Some(String::new()),
             KeyCode::Char('d') | KeyCode::Backspace => { f.images.pop(); }
             _ => {}
         },
@@ -647,6 +922,11 @@ fn handle_new_agent_key(app: &mut App, key: KeyEvent) {
 /// Convert a keypress into the bytes a terminal would send to the PTY.
 fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Alt/Meta = ESC prefix (readline word motions, Claude Code's alt-enter, …)
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        let inner = key_to_bytes(KeyEvent::new(key.code, key.modifiers - KeyModifiers::ALT));
+        return if inner.is_empty() { inner } else { [vec![0x1b], inner].concat() };
+    }
     match key.code {
         KeyCode::Char(c) => {
             if ctrl {
@@ -730,6 +1010,102 @@ mod tests {
     }
 
     #[test]
+    fn vim_keys_drive_panes_and_list() {
+        use agent::{ManagedAgent, Row};
+        let mk = |id: &str| Row::from_managed(&ManagedAgent {
+            agent_id: id.into(), harness: None, model: None, worktree: None, branch: None,
+            status: Some("done".into()), cost_usd: None, task: None, step_index: None,
+            updated_ts: None, pid: None, log_path: None,
+        });
+        let mut a = app();
+        a.all_rows = (0..30).map(|i| mk(&format!("r{i}"))).collect();
+        a.apply_filter();
+        handle_key(&mut a, ch('j'));
+        assert_eq!(a.selected, 1);
+        handle_key(&mut a, ch('G'));
+        assert_eq!(a.selected, 29);
+        handle_key(&mut a, ch('g'));
+        assert_eq!(a.selected, 0);
+        handle_key(&mut a, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(a.selected > 1, "ctrl-d half-pages");
+        // h focuses workspaces; j/k there don't move the agent list; l comes back
+        handle_key(&mut a, ch('h'));
+        assert_eq!(a.focus, Focus::Workspaces);
+        let sel = a.selected;
+        handle_key(&mut a, ch('j'));
+        assert_eq!(a.selected, sel);
+        handle_key(&mut a, ch('l'));
+        assert_eq!(a.focus, Focus::Agents);
+        // an agent key pressed while the repos pane has focus is never
+        // swallowed: focus returns to the list and the key runs there
+        handle_key(&mut a, ch('h'));
+        handle_key(&mut a, ch('x'));
+        assert_eq!(a.mode, Mode::Normal, "x in the repos pane = unpin (refused: last repo)");
+        handle_key(&mut a, ch('d'));
+        assert_eq!(a.focus, Focus::Agents, "agent key hands focus back");
+        a.mode = Mode::Normal;
+        // x always confirms
+        handle_key(&mut a, ch('x'));
+        assert_eq!(a.mode, Mode::ConfirmRemove);
+    }
+
+    #[test]
+    fn form_enter_launches_alt_enter_newlines() {
+        let mut a = app();
+        a.open_new_agent();
+        handle_new_agent_key(&mut a, ch('a'));
+        handle_new_agent_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        handle_new_agent_key(&mut a, ch('b'));
+        assert_eq!(a.new_form.task_text(), "a\nb");
+        a.new_form.task = Default::default();
+        // plain Enter submits: empty task → validation error, not a newline
+        handle_new_agent_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(a.new_form.error.is_some());
+        assert_eq!(a.new_form.task_text(), "");
+    }
+
+    #[test]
+    fn ctrl_o_reaches_the_agent_ctrl_q_detaches() {
+        let mut a = app();
+        a.mode = Mode::Terminal;
+        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(a.mode, Mode::Terminal, "Ctrl-o is Claude's transcript key");
+        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn typing_on_a_picker_field_goes_to_the_task() {
+        let mut a = app();
+        a.open_new_agent();
+        handle_new_agent_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(a.new_form.field, app::FIELD_REPO);
+        for c in "fix".chars() { handle_new_agent_key(&mut a, ch(c)); }
+        assert_eq!(a.new_form.field, app::FIELD_TASK);
+        assert_eq!(a.new_form.task_text(), "fix", "'f' jumped to task; 'i','x' typed there");
+    }
+
+    #[test]
+    fn paste_never_submits_line_by_line() {
+        let mut a = app();
+        // on the dashboard: opens a new agent with the whole text as the task
+        handle_paste(&mut a, "fix this\nstack trace line\n");
+        assert_eq!(a.mode, Mode::NewAgent);
+        assert!(a.new_form.task_text().contains("fix this\nstack trace line"), "{:?}", a.new_form.task_text());
+        assert!(a.new_form.error.is_none(), "paste must not trigger launch");
+        // one-line inputs take the first line only
+        a.mode = Mode::Filter;
+        handle_paste(&mut a, "abc\ndef");
+        assert_eq!(a.filter_text, "abc");
+    }
+
+    #[test]
+    fn alt_key_sends_esc_prefix() {
+        let b = key_to_bytes(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(b, b"\x1bb");
+    }
+
+    #[test]
     fn backtab_forwards_shift_tab_sequence() {
         // shift-tab must reach the PTY as CSI Z so Claude Code can cycle modes.
         let bytes = key_to_bytes(KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()));
@@ -740,12 +1116,16 @@ mod tests {
     fn form_tab_reaches_workflow_field_and_cycles() {
         let mut a = app();
         a.open_new_agent();
-        // Tab off the task editor lands on the workflow picker.
+        // Tab off the task editor lands on the repo picker, then harness.
         handle_new_agent_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
-        assert_eq!(a.new_form.field, app::FIELD_WORKFLOW);
-        assert_eq!(a.new_form.workflow_idx, 0);
+        assert_eq!(a.new_form.field, app::FIELD_REPO);
+        handle_new_agent_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(a.new_form.field, app::FIELD_HARNESS);
         handle_new_agent_key(&mut a, KeyEvent::new(KeyCode::Right, KeyModifiers::empty()));
-        assert_eq!(a.new_form.workflow_idx, 1);
+        assert_eq!(a.new_form.harness(), "opencode");
+        // no engine → the workflow picker is skipped
+        handle_new_agent_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(a.new_form.field, app::FIELD_MODEL);
     }
 
     #[test]
@@ -832,7 +1212,7 @@ mod tests {
     fn e2e_spawn_chat_stopall_clear() {
         let dir = std::env::temp_dir().join(format!("crew-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("CREW_INTERACTIVE_CMD_CLAUDE", "cat");
+        std::env::set_var("CREW_INTERACTIVE_CMD_CLAUDE", "sh -c cat");
         let mut a = App::new(store::Store::new(dir.clone(), dir.join("scripts")));
         a.term_size = (80, 24);
 
@@ -845,9 +1225,9 @@ mod tests {
         assert_eq!(a.agents.len(), 1);
         assert!(a.agents[0].is_alive());
 
-        // forward a keystroke to the PTY, then leave the terminal (Ctrl-o)
+        // forward a keystroke to the PTY, then leave the terminal (Ctrl-q)
         handle_terminal_key(&mut a, ch('x'));
-        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert_eq!(a.mode, Mode::Normal);
 
         // review its worktree diff (dir isn't a git repo → friendly message)
@@ -865,8 +1245,24 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!a.agents[0].is_alive(), "stop_all should have killed the agent");
 
-        // clear finished drops the dead proc
+        // the stopped agent becomes resumable; enter relaunches it in place
+        a.refresh().unwrap();
+        let r = a.selected_row().unwrap().clone();
+        assert!(r.resumable && r.proc_idx.is_some(), "stopped agent should be resumable: {:?}", r.status);
+        std::env::set_var("CREW_RESUME_CMD_CLAUDE", "cat");
+        handle_key(&mut a, ch('l'));
+        assert_eq!(a.mode, Mode::Terminal, "l should resume into chat");
+        assert_eq!(a.agents.len(), 1, "dead proc replaced, not duplicated");
+        assert!(a.agents[0].is_alive());
+        handle_terminal_key(&mut a, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        a.stop_all();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::env::remove_var("CREW_RESUME_CMD_CLAUDE");
+
+        // clear finished (confirmed) drops the dead proc
         handle_key(&mut a, ch('c'));
+        assert_eq!(a.mode, Mode::ConfirmClear);
+        handle_key(&mut a, ch('y'));
         assert!(a.agents.is_empty(), "clear_finished should remove the dead agent");
 
         std::env::remove_var("CREW_INTERACTIVE_CMD_CLAUDE");
@@ -895,6 +1291,7 @@ mod tests {
         let out = Command::new(&bin)
             .args(["--new", "hello task", "--harness", "claude"])
             .current_dir(&repo)
+            .env("XDG_CONFIG_HOME", repo.join(".xdg")) // never touch the real pinned list
             .env("CREW_HEADLESS_CMD_CLAUDE", format!("{} {}", py, fake.display()))
             .output().unwrap();
         assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));

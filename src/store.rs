@@ -26,6 +26,13 @@ pub struct AgentRecord {
     /// Optional friendly label shown instead of the task in the list.
     #[serde(default)]
     pub label: Option<String>,
+    /// Harness conversation id this agent is pinned to (claude `--session-id`),
+    /// so resume reopens *this* conversation, not the cwd's most recent one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Unix seconds when first launched (row age / recent sort).
+    #[serde(default)]
+    pub created: f64,
 }
 
 /// Remembered launch choices, persisted to `.crew/config.json` so the new-agent
@@ -180,16 +187,56 @@ impl Store {
         }
         let dest_s = dest.to_string_lossy().to_string();
         let branch = format!("crew/{}", slug);
+        self.ensure_excluded();
         // fresh branch off HEAD; on failure (branch exists) attach the existing one
-        if matches!(self.git(&["worktree", "add", "-b", &branch, &dest_s]), Some((true, _))) {
-            return Ok(dest_s);
+        let made = matches!(self.git(&["worktree", "add", "-b", &branch, &dest_s]), Some((true, _)));
+        if !made {
+            match self.git(&["worktree", "add", &dest_s, &branch]) {
+                Some((true, _)) => {}
+                Some((false, err)) => return Err(anyhow!("git worktree add failed: {}", err.trim())),
+                None => return Err(anyhow!("could not run git")),
+            }
         }
-        let attach = self.git(&["worktree", "add", &dest_s, &branch]);
-        match attach {
-            Some((true, _)) => Ok(dest_s),
-            Some((false, err)) => Err(anyhow!("git worktree add failed: {}", err.trim())),
-            None => Err(anyhow!("could not run git")),
+        self.copy_env_files(&dest);
+        Ok(dest_s)
+    }
+
+    /// Keep crew's own state (`.crew/`: registry, prefs, worktrees) out of the
+    /// user's `git status` via `.git/info/exclude` — never touches .gitignore.
+    pub fn ensure_excluded(&self) {
+        let Some(out) = Command::new("git").arg("-C").arg(&self.repo_root)
+            .args(["rev-parse", "--git-common-dir"]).output().ok().filter(|o| o.status.success())
+        else { return };
+        let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let dir = if dir.is_absolute() { dir } else { self.repo_root.join(dir) };
+        let path = dir.join("info").join("exclude");
+        let cur = std::fs::read_to_string(&path).unwrap_or_default();
+        if cur.lines().any(|l| l.trim() == "/.crew/" || l.trim() == ".crew/") {
+            return;
         }
+        let _ = std::fs::create_dir_all(dir.join("info"));
+        let sep = if cur.is_empty() || cur.ends_with('\n') { "" } else { "\n" };
+        let _ = std::fs::write(&path, format!("{cur}{sep}# crew state\n/.crew/\n"));
+    }
+
+    /// Fresh worktrees lack untracked env files; copy top-level `.env*` from
+    /// the repo root (never overwriting) so the agent's first build works.
+    fn copy_env_files(&self, dest: &Path) {
+        let Ok(rd) = std::fs::read_dir(&self.repo_root) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let target = dest.join(&name);
+            if name.to_string_lossy().starts_with(".env") && e.path().is_file() && !target.exists() {
+                let _ = std::fs::copy(e.path(), target);
+            }
+        }
+    }
+
+    /// Optional per-repo setup script run in each new worktree before the
+    /// harness starts (install deps, etc.): `<repo>/.crew/setup`.
+    pub fn setup_script(&self) -> Option<PathBuf> {
+        let p = self.repo_root.join(".crew").join("setup");
+        p.is_file().then_some(p)
     }
 
     /// Run a git command in the repo root; returns (success, stderr).
@@ -241,8 +288,13 @@ mod tests {
         let st = Store::new(repo.clone(), repo.join("no-such-scripts"));
         assert!(!st.has_engine(), "should be standalone");
 
+        std::fs::write(repo.join(".env.local"), "K=v").unwrap();
         let wt = st.create_worktree("my-task").unwrap();
         assert!(std::path::Path::new(&wt).is_dir(), "worktree dir missing: {}", wt);
+        assert!(std::path::Path::new(&wt).join(".env.local").is_file(), ".env not copied");
+        // crew's state dir never shows up in the user's git status
+        let st_out = Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain"]).output().unwrap();
+        assert!(!String::from_utf8_lossy(&st_out.stdout).contains(".crew"), "{:?}", st_out);
         assert!(wt.contains(".crew/worktrees/my-task"));
         // the branch crew/my-task exists
         let out = Command::new("git").arg("-C").arg(&repo)

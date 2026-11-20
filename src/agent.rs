@@ -70,9 +70,38 @@ pub struct Row {
     pub resumable: bool,
     /// Optional friendly label (from the registry) shown instead of the task.
     pub label: Option<String>,
+    /// Live agent idle at its prompt — needs you.
+    pub waiting: bool,
+    /// Index of the workspace this row belongs to (set by the all-repos view).
+    pub ws: usize,
 }
 
 impl Row {
+    /// Sort rank: needs-you first, then live work, failures, resumable, done.
+    pub fn rank(&self) -> u8 {
+        if self.waiting {
+            return 0;
+        }
+        match self.status.as_str() {
+            "running" => 1,
+            "failed" => 2,
+            "resumable" => 3,
+            "done" => 4,
+            "exited" => 5,
+            _ => 6, // observed sessions last
+        }
+    }
+
+    /// A live PTY agent you can type to right now.
+    pub fn is_live(&self) -> bool {
+        self.interactive && self.status == "running"
+    }
+
+    /// Status word for display ("waiting" overrides "running").
+    pub fn status_label(&self) -> &str {
+        if self.waiting { "waiting" } else { &self.status }
+    }
+
     /// What to show in the list: the label if set, else the task.
     pub fn display(&self) -> &str {
         match &self.label {
@@ -93,6 +122,7 @@ impl Row {
     /// Build a row from a live in-TUI interactive agent (PTY-backed).
     pub fn from_proc(idx: usize, p: &mut AgentProc) -> Row {
         let alive = p.is_alive();
+        let waiting = alive && p.is_waiting(5000);
         Row {
             kind: Kind::Managed,
             id: p.id.clone(),
@@ -115,6 +145,8 @@ impl Row {
             proc_idx: Some(idx),
             resumable: false,
             label: None,
+            waiting,
+            ws: 0,
         }
     }
 
@@ -130,7 +162,7 @@ impl Row {
             status: "resumable".into(),
             cost_usd: 0.0,
             ctx_pct: None,
-            updated_ts: 0.0,
+            updated_ts: rec.created,
             pid: None,
             worktree: Some(rec.worktree.clone()),
             log_path: None,
@@ -142,6 +174,8 @@ impl Row {
             proc_idx: None,
             resumable: true,
             label: rec.label.clone(),
+            waiting: false,
+            ws: 0,
         }
     }
 
@@ -169,6 +203,8 @@ impl Row {
             proc_idx: None,
             resumable: false,
             label: None,
+            waiting: false,
+            ws: 0,
         }
     }
 
@@ -195,6 +231,8 @@ impl Row {
             proc_idx: None,
             resumable: false,
             label: None,
+            waiting: false,
+            ws: 0,
         }
     }
 }

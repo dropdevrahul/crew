@@ -17,9 +17,12 @@ anyhow = "1"
 # embedded terminal: run each agent in a PTY and render it inside the TUI
 portable-pty = "0.8"
 vt100 = "0.15"
-tui-term = "0.2"
 # multiline rich task editor for the new-agent form
 tui-textarea = "0.7"
 
 [profile.release]
 opt-level = 2
+
+# vt100 0.15.2 + a one-line scrollback overflow fix — see vendor/vt100/CREW_PATCH.md
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
