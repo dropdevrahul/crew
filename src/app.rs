@@ -327,6 +327,8 @@ pub struct Workspace {
     pub selected: usize,
     pub mode: Mode,
     pub status_msg: String,
+    /// Mouse selection in the chat pane: pane-relative (row,col) start,end.
+    pub selection: Option<((u16, u16), (u16, u16))>,
     pub new_form: NewAgentForm,
     pub show_observed: bool,
     pub all_rows: Vec<Row>,
@@ -407,6 +409,7 @@ impl Workspace {
             selected: 0,
             mode: Mode::Normal,
             status_msg: String::new(),
+            selection: None,
             new_form: NewAgentForm::default(),
             show_observed: prefs.show_observed,
             all_rows: Vec::new(),
@@ -846,7 +849,7 @@ impl Workspace {
     }
 
     /// Copy `text` to the clipboard (`pbcopy`/`xclip`/`wl-copy`). Best-effort.
-    fn yank_text(&mut self, text: &str, label: &str) {
+    pub(crate) fn yank_text(&mut self, text: &str, label: &str) {
         let candidates: [&[&str]; 3] =
             [&["pbcopy"], &["xclip", "-selection", "clipboard"], &["wl-copy"]];
         for argv in candidates {

@@ -152,6 +152,11 @@ pub struct AgentProc {
     pub tmux: Option<String>,
 }
 
+/// Order two (row,col) selection corners reading-order: (start, end).
+pub fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
 impl AgentProc {
     /// Spawn `argv` in a PTY at `cwd`. `task` is display-only — the first
     /// prompt travels in argv (see `interactive_argv`), never typed in.
@@ -266,6 +271,15 @@ impl AgentProc {
             tmux,
         };
         Ok(proc)
+    }
+
+    /// Text under a drag-selection (pane-relative (row,col) corners, either
+    /// order; both end cells inclusive), trailing blanks trimmed per line.
+    pub fn selection_text(&self, a: (u16, u16), b: (u16, u16)) -> String {
+        let ((r0, c0), (r1, c1)) = normalize_selection(a, b);
+        let Ok(p) = self.parser.lock() else { return String::new() };
+        let text = p.screen().contents_between(r0, c0, r1, c1.saturating_add(1));
+        text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
     }
 
     /// Forward raw bytes (a keypress) to the agent. Typing snaps a scrolled-
@@ -391,6 +405,21 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_normalizes_reversed_drag() {
+        assert_eq!(normalize_selection((3, 5), (1, 2)), ((1, 2), (3, 5)));
+        assert_eq!(normalize_selection((1, 2), (3, 5)), ((1, 2), (3, 5)));
+    }
+
+    #[test]
+    fn selection_extracts_text_from_screen() {
+        let mut p = vt100::Parser::new(5, 20, 0);
+        p.process(b"hello world\r\nsecond line");
+        let s = p.screen();
+        assert_eq!(s.contents_between(0, 6, 0, 11), "world");
+        assert_eq!(s.contents_between(0, 6, 1, 6), "world\nsecond");
+    }
 
     #[test]
     fn pty_captures_command_output() {

@@ -348,6 +348,7 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
                     // wheel over the chat scrolls its history; other mouse
                     // input stays out of the agent's way
                     let w = terminal.size().map(|s| s.width).unwrap_or(80);
+                    chat_select(app, m, w);
                     match m.kind {
                         MouseEventKind::ScrollUp => wheel_chat(app, true, m.column, m.row, w),
                         MouseEventKind::ScrollDown => wheel_chat(app, false, m.column, m.row, w),
@@ -358,6 +359,9 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
                     let w = terminal.size().map(|s| s.width).unwrap_or(80);
                     // zoomed: the detail pane owns the whole width
                     let tree_w = if app.zoom { 0 } else { ui::pane_widths(app, w).0 };
+                    if app.agent_selected() {
+                        chat_select(app, m, w);
+                    }
                     match m.kind {
                         MouseEventKind::ScrollDown => {
                             if m.column < tree_w { app.tree_move(1); }
@@ -555,6 +559,40 @@ fn wheel_chat(app: &mut App, up: bool, col: u16, row: u16, width: u16) {
     let x0 = if app.zoom { 1 } else { ui::pane_widths(app, width).0 + 1 };
     if let Some(p) = app.selected_proc() {
         p.wheel(up, col.saturating_sub(x0), row.saturating_sub(2));
+    }
+}
+
+/// Left-drag over the chat pane selects text (never forwarded to the agent);
+/// releasing a non-empty selection copies it. Down starts, Drag extends, Up
+/// finishes; a plain click leaves nothing behind.
+fn chat_select(app: &mut App, m: crossterm::event::MouseEvent, width: u16) {
+    let x0 = if app.zoom { 1 } else { ui::pane_widths(app, width).0 + 1 };
+    let Some((rows, cols)) = app.selected_proc()
+        .and_then(|p| p.parser.lock().ok().map(|p| p.screen().size())) else { return };
+    let inside = m.column >= x0 && m.row >= 2 && m.column < x0 + cols && m.row < 2 + rows;
+    let cell = (
+        m.row.saturating_sub(2).min(rows.saturating_sub(1)),
+        m.column.saturating_sub(x0).min(cols.saturating_sub(1)),
+    );
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.selection = inside.then_some((cell, cell));
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((s, _)) = app.selection {
+                app.selection = Some((s, cell));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some((s, e)) = app.selection.take() {
+                if s != e {
+                    let text = app.selected_proc().map(|p| p.selection_text(s, e)).unwrap_or_default();
+                    app.yank_text(&text, "selection");
+                    app.status_msg = format!("copied {} chars", text.chars().count());
+                }
+            }
+        }
+        _ => {}
     }
 }
 

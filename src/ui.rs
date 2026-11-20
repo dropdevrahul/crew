@@ -574,7 +574,9 @@ fn vt_color(c: vt100::Color) -> Color {
 /// Paint a vt100 screen into `area` cell by cell (colors, bold/italic/
 /// underline/inverse, wide chars), plus a block cursor when focused and at the
 /// live bottom.
-fn render_screen(buf: &mut ratatui::buffer::Buffer, area: Rect, screen: &vt100::Screen, cursor: bool) {
+fn render_screen(buf: &mut ratatui::buffer::Buffer, area: Rect, screen: &vt100::Screen, cursor: bool,
+                 sel: Option<((u16, u16), (u16, u16))>) {
+    let sel = sel.map(|(a, b)| crate::pty::normalize_selection(a, b));
     for row in 0..area.height {
         for col in 0..area.width {
             let Some(c) = screen.cell(row, col) else { continue };
@@ -585,7 +587,8 @@ fn render_screen(buf: &mut ratatui::buffer::Buffer, area: Rect, screen: &vt100::
             if c.bold() { st = st.add_modifier(Modifier::BOLD); }
             if c.italic() { st = st.add_modifier(Modifier::ITALIC); }
             if c.underline() { st = st.add_modifier(Modifier::UNDERLINED); }
-            if c.inverse() { st = st.add_modifier(Modifier::REVERSED); }
+            let picked = sel.is_some_and(|(s, e)| (row, col) >= s && (row, col) <= e);
+            if c.inverse() != picked { st = st.add_modifier(Modifier::REVERSED); }
             let cell = &mut buf[(area.x + col, area.y + row)];
             let sym = c.contents();
             cell.set_symbol(if c.has_contents() { &sym } else { " " });
@@ -632,7 +635,7 @@ fn draw_terminal(f: &mut Frame, app: &App, idx: usize, area: Rect) {
         // keep the PTY sized to the visible pane
         proc.resize(inner.height.max(1), inner.width.max(1));
         if let Ok(parser) = proc.parser.lock() {
-            render_screen(f.buffer_mut(), inner, parser.screen(), focused);
+            render_screen(f.buffer_mut(), inner, parser.screen(), focused, app.selection);
         }
     }
 }
@@ -1219,6 +1222,17 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_cells_are_reversed() {
+        let mut p = vt100::Parser::new(2, 10, 0);
+        p.process(b"hello");
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_screen(&mut buf, area, p.screen(), false, Some(((0, 3), (0, 1))));
+        let rev = |x| buf[(x, 0)].modifier.contains(Modifier::REVERSED);
+        assert!(!rev(0) && rev(1) && rev(3) && !rev(4));
+    }
     use crate::app::App;
     use crate::store::Store;
     use ratatui::{backend::TestBackend, Terminal};
