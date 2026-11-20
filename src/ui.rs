@@ -750,7 +750,7 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let chat = format!("CHAT — [{}] leader · q back · Tab agents · [wheel / Shift-PgUp] history · [Shift-drag] select text · [shift-tab] agent modes", crate::leader::spec_label(&app.leader.chat_key));
+    let chat = format!("CHAT — [{}] leader · q back · Tab agents · [wheel / Shift-PgUp] history · [drag] select + copy · [shift-tab] agent modes", crate::leader::spec_label(&app.leader.chat_key));
     let keys = match app.mode {
         Mode::Terminal => chat.as_str(),
         Mode::Diff => "DIFF — [j/k] line [^d/^u] half [^f/^b] page [g/G] ends [/] search [n/N] next   ·   [q/esc] close",
@@ -900,14 +900,21 @@ fn draw_help(f: &mut Frame, app: &App) {
     let area = centered(86, 92, f.area());
     f.render_widget(Clear, area);
     // grouped cheatsheet (lazygit-style): (section, [(keys, desc)])
-    let groups: [(&str, &[(&str, &str)]); 6] = [
+    let groups: [(&str, &[(&str, &str)]); 7] = [
+        ("Leader & picker", &[
+            ("Space / ^Space", "leader: dashboard / in a chat, then a key:"),
+            ("  q · Tab", "back (leave chat / quit) · agent picker"),
+            ("  n · d · P", "new agent · diff · push"),
+            ("  s · z · ? · ,", "stop · zoom · help · settings"),
+            ("^p", "agent picker: type to filter · enter opens"),
+        ]),
         ("Navigate (vim)", &[
             ("j / k · ↑ / ↓", "move"),
             ("h / l · ← / →", "repos pane · open (chat / resume / log)"),
             ("g / G · ^d / ^u", "top / bottom · half page (lists + viewers)"),
-            ("tab · a", "toggle panes · back to all repos"),
+            ("a", "back to all repos"),
             ("] / [", "next / prev failed agent"),
-            ("space / A", "mark row / mark all"),
+            ("A", "mark all visible for bulk ops"),
             ("esc", "clear marks → search → category"),
         ]),
         ("Launch & drive", &[
@@ -916,7 +923,7 @@ fn draw_help(f: &mut Frame, app: &App) {
             ("Ctrl-q", "leave the chat"),
             ("z", "zoom chat / preview to full width"),
             ("wheel · S-PgUp/Dn", "scroll the chat's history (typing returns)"),
-            ("Shift-drag", "select text to copy (crew captures the mouse)"),
+            ("drag (chat)", "select text · release copies to the clipboard"),
             ("paste", "on the list: starts a new agent with it as the task"),
             ("trust", "untrusted repo: claude defaults to No — pick Yes, or run claude in the repo once"),
             ("shift-tab", "(in chat) cycle the agent's modes"),

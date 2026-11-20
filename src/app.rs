@@ -1545,11 +1545,6 @@ impl App {
         app
     }
 
-    /// Stub for `Action::Agents` until the real agent picker lands.
-    pub fn open_picker(&mut self) {
-        self.status_msg = "agent picker not built yet".into();
-    }
-
     /// Note the launch folder: pin it quietly if it's an unpinned git repo
     /// (never switches the view — crew opens on "all"), and remember it as the
     /// default repo for new agents. Returns true if it pinned (caller saves).

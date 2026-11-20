@@ -205,7 +205,8 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
     to the agent when it handles the mouse itself (Claude's fullscreen UI),
     otherwise crew scrolls the terminal's 2000-line scrollback. Typing returns
     to the live view.
-  - **Copy**: crew captures the mouse, so select with `Shift`-drag.
+  - **Copy**: drag across the chat to select; releasing copies the text to the
+    system clipboard (`pbcopy` / `xclip` / `wl-copy`). The wheel still scrolls history.
 - **Notifications** — when an agent finishes or starts waiting, crew rings the
   terminal bell and posts a desktop notification (OSC 9: iTerm2, kitty,
   WezTerm, Ghostty), so you hear about it from another window.
@@ -231,7 +232,10 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
 | `j`/`k` or `↑`/`↓` | move through the repo → agents tree · `g`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` half page · `Ctrl-f`/`Ctrl-b` page |
 | `h`/`l` or `←`/`→` | `h` climbs from an agent to its repo · `l` steps from a repo into its agents (or opens the agent) |
 | `]`/`[` | next/prev **failed** agent |
-| `space` / `A` | mark row / mark all for bulk ops |
+| `space` | **leader** key (see *Leader key* below); no longer marks a row |
+| `A` | mark all visible rows for bulk ops |
+| `Ctrl-p` | agent picker (see *Agent picker* below) |
+| `Ctrl-space` | (in chat) **leader** key; `Ctrl-q` still leaves the chat |
 | `esc` | peel one layer: marks → search → category |
 | mouse click / wheel | select a row · scroll · click the terminal pane to chat |
 | `1` `2` `3` `4` | quick-filter: all / running / agents / sessions |
@@ -259,6 +263,44 @@ preview / embedded chat. Real output of `CREW_SNAPSHOT_MODE=demo crew --snapshot
 | `x` | remove the selected agent — or **all marked** (confirmed; no longer resumable) |
 | `c` | forget finished (exited + resumable) rows (confirmed) |
 | `/` | search · `H` hide/show observed sessions |
+
+### Leader key
+
+Press the leader, then one key. It is `Space` on the dashboard and `Ctrl-Space`
+inside a chat (`Ctrl-q` still leaves a chat). A which-key popup lists the bindings:
+
+| after the leader | action |
+|---|---|
+| `q` | back: leave the chat, or quit (confirms) from the dashboard |
+| `Tab` | agent picker |
+| `n` · `d` · `P` | new agent · diff · push |
+| `s` · `z` | stop · zoom |
+| `?` · `,` | help · settings |
+
+Remap it in `~/.config/crew/workspaces.json` (or `$XDG_CONFIG_HOME/crew/`) with a
+`leader` block. `key` is the dashboard leader, `chat_key` the in-chat one, and
+`bindings` maps a key to an action name (`back`, `agents`, `new_agent`, `diff`,
+`push`, `stop`, `zoom`, `help`, `settings`). Key specs: `space`, `tab`, `enter`,
+`esc`, `ctrl-<key>` (including `ctrl-space`), or a single character. Missing fields
+keep their defaults, but a `bindings` list replaces all of them.
+
+```json
+"leader": {
+  "key": "ctrl-g",
+  "bindings": [["q", "back"], ["tab", "agents"], ["n", "new_agent"], ["d", "diff"],
+               ["P", "push"], ["s", "stop"], ["z", "zoom"], ["?", "help"], [",", "settings"]]
+}
+```
+
+Space is the leader by default, so it no longer marks a row. Set `leader.key` to
+another key, as above, to get single-row marking back with `space`.
+
+### Agent picker
+
+`Space Tab` opens the agent picker on the dashboard (`Ctrl-Space Tab` in a chat,
+or `Ctrl-p` on the dashboard). Type to filter by repo, task, harness or status;
+every word you type must match. `Up`/`Down` or `Ctrl-n`/`Ctrl-p` move, `Enter`
+opens the agent (a live agent goes straight to its chat), and `Esc` cancels.
 
 ### New-agent form
 
