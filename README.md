@@ -9,6 +9,9 @@ chat **inside the TUI**, side-by-side with the agent list; `Ctrl-q` returns to t
 dashboard. No switching windows. With tmux installed, agents keep running after
 you quit crew and re-attach on the next launch.
 
+<img width="2940" height="1840" alt="image" src="https://github.com/user-attachments/assets/8d1f4445-0cbe-4b78-add5-e9e9b10576b4" />
+
+
 ## Standalone — no backend required
 
 crew runs on its own: it creates git worktrees **natively** (a `crew/<task>`
