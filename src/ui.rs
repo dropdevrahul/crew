@@ -166,6 +166,7 @@ fn draw_inner(f: &mut Frame, app: &App) {
         Mode::ConfirmClear => draw_confirm_clear(f, app),
         Mode::Rename => draw_rename(f, app),
         Mode::Picker => draw_picker(f, app),
+        Mode::Search => draw_search(f, app),
         _ => {}
     }
     if app.leader_pending {
@@ -759,6 +760,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Normal | Mode::Filter if !app.agent_selected() => "REPO — [j/k] move · [l] first agent · [n]ew agent · [w] pin folder · [x] unpin · [?] help",
         // most-needed first: narrow terminals cut from the right
         Mode::Normal | Mode::Filter => "[?]help [n]ew [enter]chat/resume [q]uit [j/k]move [h]repo [d]iff [P]ush [s]top [x]rm [z]oom",
+        Mode::Search => "SEARCH — type to filter · [tab] files ↔ grep · [↑/↓ ^n/^p] move · [enter] open in editor · [^y] copy path:line · [esc] close",
         Mode::Picker => "PICK AN AGENT — type to filter · [^n/^p] move · [enter] open · [esc] cancel",
         _ => "", // modals carry their own key hints
     };
@@ -907,6 +909,7 @@ fn draw_help(f: &mut Frame, app: &App) {
             ("  n · d · P", "new agent · diff · push"),
             ("  s · z · ? · ,", "stop · zoom · help · settings"),
             ("^p · ^Tab", "agent picker: type to filter · enter opens"),
+            ("v · ^q f · ^q /", "review changes (diffview) · find files · live grep (rg)"),
         ]),
         ("Navigate (vim)", &[
             ("j / k · ↑ / ↓", "move"),
@@ -1067,6 +1070,59 @@ fn draw_diff(f: &mut Frame, app: &App) {
         area,
     );
     scrollbar(f, area, app.diff_scroll, total);
+}
+
+/// Native search: query box on top, hits on the left, preview on the right.
+fn draw_search(f: &mut Frame, app: &App) {
+    use crate::search::Kind;
+    let area = centered(92, 85, f.area());
+    f.render_widget(Clear, area);
+    let s = &app.search;
+    let root = std::path::Path::new(&s.root).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let kind = if s.kind == Kind::Files { "files" } else { "grep" };
+    let rows = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)]).split(area);
+    let count = if s.note.is_empty() { format!(" {} results ", s.hits.len()) } else { format!(" {} ", s.note) };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{}▏", s.query)),
+        ])).block(panel_focused(&format!(" {} · {} · [tab] {} ", kind, root,
+            if s.kind == Kind::Files { "grep" } else { "files" }), ACCENT)
+            .title_bottom(Line::from(count).right_aligned())),
+        rows[0],
+    );
+    let cols = Layout::default().direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Min(20)]).split(rows[1]);
+    let w = cols[0].width.saturating_sub(4) as usize;
+    let items: Vec<ListItem> = s.hits.iter().map(|h| {
+        if s.kind == Kind::Files {
+            ListItem::new(truncate(&h.path, w))
+        } else {
+            let loc = format!("{}:{} ", h.path, h.line);
+            ListItem::new(Line::from(vec![
+                Span::styled(truncate(&loc, w / 2), Style::default().fg(Color::DarkGray)),
+                Span::raw(truncate(&h.text, w.saturating_sub(loc.chars().count().min(w / 2)))),
+            ]))
+        }
+    }).collect();
+    let hint = if s.hits.is_empty() && s.kind == Kind::Grep && s.query.chars().count() < 2 { " type 2+ chars " } else { " results " };
+    let list = List::new(items).block(panel(hint))
+        .highlight_style(Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    state.select(if s.hits.is_empty() { None } else { Some(s.cursor) });
+    f.render_stateful_widget(list, cols[0], &mut state);
+
+    let name = s.hits.get(s.cursor).map(|h| h.path.as_str()).unwrap_or("");
+    let lines: Vec<Line> = s.preview.iter().enumerate().map(|(i, l)| {
+        let hl = i == s.preview_hl;
+        Line::from(vec![
+            Span::styled(format!("{:>4} ", s.preview_from + i), Style::default().fg(Color::DarkGray)),
+            Span::styled(l.clone(), if hl { Style::default().bg(ACCENT).fg(Color::Black) } else { Style::default() }),
+        ])
+    }).collect();
+    f.render_widget(Paragraph::new(lines).block(panel(&format!(" {} ", name))), cols[1]);
 }
 
 /// Title fragment showing the in-viewer search state ("" when idle).

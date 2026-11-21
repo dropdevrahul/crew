@@ -17,6 +17,9 @@ pub enum Action {
     Zoom,
     Help,
     Settings,
+    Review,
+    Grep,
+    Files,
 }
 
 impl Action {
@@ -31,6 +34,9 @@ impl Action {
             "zoom" => Action::Zoom,
             "help" => Action::Help,
             "settings" => Action::Settings,
+            "review" => Action::Review,
+            "grep" => Action::Grep,
+            "files" => Action::Files,
             _ => return None,
         })
     }
@@ -46,11 +52,14 @@ impl Action {
             Action::Zoom => "zoom",
             Action::Help => "help",
             Action::Settings => "settings",
+            Action::Review => "review",
+            Action::Grep => "grep",
+            Action::Files => "files",
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Leader {
     /// Leader key on the dashboard.
     #[serde(default = "default_key")]
@@ -80,6 +89,9 @@ fn default_bindings() -> Vec<(String, Action)> {
         ("z", Action::Zoom),
         ("?", Action::Help),
         (",", Action::Settings),
+        ("v", Action::Review),
+        ("/", Action::Grep),
+        ("f", Action::Files),
     ]
     .into_iter()
     .map(|(k, a)| (k.to_string(), a))
@@ -93,6 +105,18 @@ impl Default for Leader {
 }
 
 impl Leader {
+    /// Bind actions added in newer versions that a saved config doesn't
+    /// mention, unless their default key is already taken by the user.
+    pub fn add_missing_defaults(&mut self) {
+        for (key, action) in default_bindings() {
+            let has_action = self.bindings.iter().any(|(_, a)| *a == action);
+            let key_taken = self.bindings.iter().any(|(k, _)| *k == key);
+            if !has_action && !key_taken {
+                self.bindings.push((key, action));
+            }
+        }
+    }
+
     /// The action bound to `key`, if any.
     pub fn lookup(&self, key: &KeyEvent) -> Option<Action> {
         self.bindings.iter().find(|(spec, _)| key_matches(spec, key)).map(|(_, a)| *a)
@@ -181,10 +205,26 @@ mod tests {
     }
 
     #[test]
+    fn saved_bindings_gain_new_default_actions() {
+        let mut l: Leader = serde_json::from_str(r#"{"bindings":[["q","back"],["f","diff"]]}"#).unwrap();
+        l.add_missing_defaults();
+        assert_eq!(l.lookup(&k(KeyCode::Char('f'), KeyModifiers::empty())), Some(Action::Diff), "user's key wins");
+        assert_eq!(l.lookup(&k(KeyCode::Char('/'), KeyModifiers::empty())), Some(Action::Grep), "new action added");
+        assert!(!l.bindings.iter().any(|(_, a)| *a == Action::Files), "its default key is taken: skipped");
+    }
+
+    #[test]
+    fn default_leader_is_not_persisted() {
+        // a saved copy of the defaults would freeze them and hide new bindings
+        let cfg = crate::workspace::GlobalConfig::default();
+        assert!(!serde_json::to_string(&cfg).unwrap().contains("leader"));
+    }
+
+    #[test]
     fn partial_config_loads() {
         let l: Leader = serde_json::from_str(r#"{"key":"ctrl-g"}"#).unwrap();
         assert_eq!(l.key, "ctrl-g");
         assert_eq!(l.chat_key, "ctrl-q");
-        assert_eq!(l.bindings.len(), 9);
+        assert_eq!(l.bindings.len(), 12);
     }
 }

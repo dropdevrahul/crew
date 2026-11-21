@@ -257,7 +257,8 @@ an **all** row), and a live preview / embedded chat. Real output of
 | `R` | **retry / re-delegate** the task to a harness you pick (needs engine) |
 | `s` / `S` | stop selected/marked · stop **all** (confirmed; they stay resumable) |
 | `o` / `y` / `Y` | worktree path · yank path · yank branch |
-| `e` / `!` | open the worktree in `$EDITOR` · drop to a `$SHELL` there |
+| `v` | **review** what the agent changed (vs where it forked, committed or not) in nvim + diffview.nvim; see *Search & launchers* |
+| `e` / `!` | open the worktree in your editor (default nvim) · drop to a `$SHELL` there |
 | `O` / `f` | open the agent's PR (or branch) in the browser · `git fetch` |
 | `,` | settings — persisted default harness/model/workflow/worktree |
 | `r` | rename / label a crew-launched agent |
@@ -277,11 +278,12 @@ chat. A which-key popup lists the bindings:
 | `n` · `d` · `P` | new agent · diff · push |
 | `s` · `z` | stop · zoom |
 | `?` · `,` | help · settings |
+| `v` · `f` · `/` | review changes · find files · grep (see *Search & launchers*) |
 
 Remap it in `~/.config/crew/workspaces.json` (or `$XDG_CONFIG_HOME/crew/`) with a
 `leader` block. `key` is the dashboard leader, `chat_key` the in-chat one, and
 `bindings` maps a key to an action name (`back`, `agents`, `new_agent`, `diff`,
-`push`, `stop`, `zoom`, `help`, `settings`). Key specs: `space`, `tab`, `enter`,
+`push`, `stop`, `zoom`, `help`, `settings`, `review`, `grep`, `files`). Key specs: `space`, `tab`, `enter`,
 `esc`, `ctrl-<key>` (including `ctrl-space`; some terminals and macOS swallow it), or a single character. Missing fields
 keep their defaults, but a `bindings` list replaces all of them.
 
@@ -295,6 +297,32 @@ keep their defaults, but a `bindings` list replaces all of them.
 
 To use `Space` as the dashboard leader instead, set `"key": "space"` (it then no
 longer marks rows). Inside a chat Space is typed text, so keep a `ctrl-` key for `chat_key`.
+
+### Search & launchers
+
+Search runs in the selected agent's worktree (on a repo line: the repo) and opens
+hits in **your** editor at the matching line: `"editor"` in
+`~/.config/crew/workspaces.json`, else `$VISUAL`/`$EDITOR`, else nvim. Terminal
+editors take over the screen and return you to crew when you quit them; it works
+from inside a chat too.
+
+| key | does |
+|---|---|
+| `Ctrl-q f` | **find files**: fuzzy, gitignore-aware (`rg --files`), with a preview |
+| `Ctrl-q /` | **live grep** (ripgrep, smart-case regex), preview centred on the hit |
+| in search | type to filter · `Tab` files ↔ grep · `↑`/`↓` or `Ctrl-n`/`Ctrl-p` · `Enter` open in editor · `Ctrl-y` copy `path:line` · `Esc` close |
+| `v` · `Ctrl-q v` | **review** the agent's changes vs its fork point: nvim + `:DiffviewOpen <base>` (falls back to fugitive's `:Git difftool`) |
+| `e` | open the worktree in your editor |
+
+Grep needs `rg` on your PATH; review wants
+[diffview.nvim](https://github.com/sindrets/diffview.nvim) (vim-plug:
+`Plug 'sindrets/diffview.nvim'`). Swap the review tool with `commands.review`, run
+through `sh -c` in the worktree with `{base}` and `{worktree}` filled in:
+
+```json
+"editor": "hx",
+"commands": { "review": "lazygit -p {worktree}" }
+```
 
 ### Agent picker
 

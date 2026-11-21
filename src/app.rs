@@ -12,8 +12,9 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use tui_textarea::TextArea;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
+    #[default]
     Normal,
     NewAgent,
     Help,
@@ -45,6 +46,8 @@ pub enum Mode {
     BrowseFolder,
     /// Telescope-style fuzzy agent picker overlay.
     Picker,
+    /// Native file finder / live grep over the agent's directory.
+    Search,
 }
 
 /// State for `Mode::Picker`: the filter query, the highlighted row and the
@@ -373,6 +376,7 @@ pub struct Workspace {
     /// Text buffer while labeling an agent (Mode::Rename).
     pub rename_buf: String,
     pub picker: Picker,
+    pub search: crate::search::Search,
     /// Cached git status of the selected worktree: (path, summary, is_clean).
     pub worktree_status: Option<(String, String, bool)>,
     /// Cached remote state of the selected branch (not pushed / ↑a ↓b / up to date).
@@ -437,6 +441,7 @@ impl Workspace {
             settings_backend: String::new(),
             rename_buf: String::new(),
             picker: Picker::default(),
+            search: Default::default(),
             worktree_status: None,
             sel_remote: None,
             pr_map: HashMap::new(),
@@ -594,17 +599,104 @@ impl Workspace {
         self.mode = Mode::Normal;
     }
 
-    /// Request opening the selected worktree in `$EDITOR` (default `vi`).
+    /// Request opening the selected worktree in the editor (config `editor`,
+    /// else $VISUAL / $EDITOR, else nvim).
     pub fn open_editor(&mut self) {
         let Some(wt) = self.selected_row().and_then(|r| r.worktree.clone()) else {
             self.status_msg = "no worktree to open".into();
             return;
         };
-        let ed = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-        // split EDITOR so values like "code -w" work; then the worktree path
+        let ed = resolve_editor(&crate::workspace::load_global().editor);
+        // split so values like "code -w" work; then the worktree path
         let mut argv: Vec<String> = ed.split_whitespace().map(String::from).collect();
         argv.push(wt.clone());
         self.pending_shell = Some((wt, argv));
+    }
+
+    /// Run a named launcher ("review", "grep", "files") in the selected agent's
+    /// worktree (on a repo line: the repo itself). The command is the user's
+    /// override from config, else the nvim default.
+    pub fn open_tool(&mut self, name: &str) {
+        let wt = self.tool_root();
+        let cfg = crate::workspace::load_global().commands;
+        let tpl = cfg.get(name).map(|c| c.trim()).filter(|c| !c.is_empty())
+            .unwrap_or_else(|| default_tool(name));
+        let cmd = tpl.replace("{base}", &sh_quote(&base_ref(&wt))).replace("{worktree}", &sh_quote(&wt));
+        self.pending_shell = Some((wt, vec!["sh".into(), "-c".into(), cmd]));
+    }
+
+    /// The directory tools work in: the selected agent's worktree, else the repo.
+    fn tool_root(&self) -> String {
+        self.selected_row().and_then(|r| r.worktree.clone())
+            .unwrap_or_else(|| self.store.repo_root.to_string_lossy().into_owned())
+    }
+
+    // ── native search (Mode::Search) ────────────────────────────────────────
+    /// Open the file finder / live grep over the agent's directory.
+    pub fn open_search(&mut self, kind: crate::search::Kind) {
+        let root = self.tool_root();
+        let candidates = if kind == crate::search::Kind::Files { crate::search::list_files(&root) } else { vec![] };
+        let ret = if self.mode == Mode::Terminal { Mode::Terminal } else { Mode::Normal };
+        self.search = crate::search::Search { kind, root, candidates, ret, ..Default::default() };
+        self.search_update();
+        self.mode = Mode::Search;
+    }
+
+    /// Re-run the query (rank files, or grep) and refresh the preview.
+    pub fn search_update(&mut self) {
+        use crate::search::{grep, list_files, rank, Kind};
+        let s = &mut self.search;
+        s.note.clear();
+        s.hits = match s.kind {
+            Kind::Files => {
+                if s.candidates.is_empty() {
+                    s.candidates = list_files(&s.root);
+                }
+                rank(&s.query, &s.candidates)
+            }
+            Kind::Grep => grep(&s.root, &s.query).unwrap_or_else(|e| { s.note = e; vec![] }),
+        };
+        s.cursor = s.cursor.min(s.hits.len().saturating_sub(1));
+        self.search_preview();
+    }
+
+    pub fn search_preview(&mut self) {
+        let s = &mut self.search;
+        (s.preview, s.preview_hl, s.preview_from) = match s.hits.get(s.cursor) {
+            Some(h) => crate::search::preview(&s.root, h, 12),
+            None => (vec![], usize::MAX, 1),
+        };
+    }
+
+    pub fn search_move(&mut self, d: i64) {
+        let n = self.search.hits.len() as i64;
+        if n > 0 {
+            self.search.cursor = (self.search.cursor as i64 + d).clamp(0, n - 1) as usize;
+        }
+        self.search_preview();
+    }
+
+    pub fn search_toggle_kind(&mut self) {
+        use crate::search::Kind;
+        self.search.kind = if self.search.kind == Kind::Files { Kind::Grep } else { Kind::Files };
+        self.search.cursor = 0;
+        self.search_update();
+    }
+
+    /// Open the selected hit in the user's editor at its line, in the agent's
+    /// directory (crew suspends until the editor exits).
+    pub fn search_open(&mut self) {
+        let Some(h) = self.search.hits.get(self.search.cursor).cloned() else { return };
+        let ed = resolve_editor(&crate::workspace::load_global().editor);
+        let argv = crate::search::editor_argv(&ed, &h.path, h.line);
+        self.pending_shell = Some((self.search.root.clone(), argv));
+        self.mode = self.search.ret;
+    }
+
+    pub fn search_yank(&mut self) {
+        if let Some(h) = self.search.hits.get(self.search.cursor).cloned() {
+            self.yank_text(&format!("{}:{}", h.path, h.line), "file reference");
+        }
     }
 
     /// Request a `$SHELL` (default `bash`) in the selected worktree.
@@ -1542,6 +1634,7 @@ impl App {
         let active = cfg.active.min(workspaces.len() - 1);
         let mut app = App::shell(workspaces, active);
         app.leader = cfg.leader.clone();
+        app.leader.add_missing_defaults();
         app
     }
 
@@ -1958,6 +2051,8 @@ impl App {
             theme: crate::workspace::load_global().theme,
             active: self.active,
             leader: self.leader.clone(),
+            editor: crate::workspace::load_global().editor,
+            commands: crate::workspace::load_global().commands,
             workspaces: self
                 .workspaces
                 .iter()
@@ -2343,6 +2438,38 @@ fn worktree_diff(wt: &str) -> String {
     }
 }
 
+/// Default launcher commands: review = nvim with diffview.nvim (fugitive fallback).
+fn default_tool(name: &str) -> &'static str {
+    match name {
+        _ => r#"nvim -c "if exists(':DiffviewOpen') | DiffviewOpen {base} | else | Git difftool --name-status {base} | endif""#,
+    }
+}
+
+/// The editor to run: configured, else $VISUAL / $EDITOR, else nvim (if
+/// installed), else vi.
+pub fn resolve_editor(configured: &str) -> String {
+    if !configured.trim().is_empty() {
+        return configured.trim().to_string();
+    }
+    ["VISUAL", "EDITOR"].iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| if on_path("nvim") { "nvim".into() } else { "vi".into() })
+}
+
+/// Commit to review against: the merge-base with main/master (so an agent's
+/// committed and uncommitted work both show), else HEAD.
+pub fn base_ref(wt: &str) -> String {
+    ["origin/HEAD", "main", "master"].iter()
+        .map(|m| git_out(wt, &["merge-base", "HEAD", m]))
+        .find(|b| !b.is_empty())
+        .unwrap_or_else(|| "HEAD".into())
+}
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 pub fn slugify(task: &str) -> String {
     let base: String = task
         .chars()
@@ -2381,6 +2508,48 @@ mod tests {
         std::fs::write(repo.join("seed.txt"), "x").unwrap();
         g(&["add", "seed.txt"]); g(&["commit", "-qm", "init"]);
         std::fs::canonicalize(&repo).unwrap()
+    }
+
+    #[test]
+    fn review_diffs_against_the_fork_point() {
+        use std::process::Command;
+        let repo = git_repo("review");
+        let g = |a: &[&str]| { Command::new("git").arg("-C").arg(&repo).args(a).output().unwrap(); };
+        g(&["branch", "-M", "main"]);
+        let fork = git_out(&repo.to_string_lossy(), &["rev-parse", "HEAD"]);
+        g(&["checkout", "-qb", "feat"]);
+        std::fs::write(repo.join("n.txt"), "y").unwrap();
+        g(&["add", "."]); g(&["commit", "-qm", "work"]); // committed work still counts
+        let wt = repo.to_string_lossy().into_owned();
+        assert_eq!(base_ref(&wt), fork);
+
+        let mut a = App::new(Store::new(repo.clone(), repo.join("s")));
+        a.open_tool("review"); // repo line: no selected agent → the repo itself
+        let (cwd, argv) = a.pending_shell.take().unwrap();
+        assert_eq!(cwd, wt);
+        assert_eq!(&argv[..2], ["sh", "-c"]);
+        assert!(argv[2].contains(&format!("DiffviewOpen '{fork}'")), "{}", argv[2]);
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
+        assert_eq!(resolve_editor("hx -w"), "hx -w");
+        // native search runs in the same directory and opens hits in the editor
+        std::fs::write(repo.join("lib.rs"), "fn a() {}\nfn needle() {}\n").unwrap();
+        a.open_search(crate::search::Kind::Files);
+        assert_eq!((a.mode, a.search.root.as_str()), (Mode::Search, wt.as_str()));
+        a.search.query = "lib".into();
+        a.search_update();
+        assert_eq!(a.search.hits[0].path, "lib.rs");
+        if on_path("rg") {
+            a.search_toggle_kind();
+            a.search.query = "needle".into();
+            a.search_update();
+            assert_eq!(a.search.hits.first().map(|h| h.line), Some(2));
+        }
+        a.search_open();
+        let (cwd, argv) = a.pending_shell.take().unwrap();
+        assert_eq!(cwd, wt);
+        assert!(argv.last().unwrap() == "lib.rs", "{argv:?}");
+        assert_eq!(a.mode, Mode::Normal);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     fn rec(id: &str, wt: &str) -> AgentRecord {

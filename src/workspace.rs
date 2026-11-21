@@ -32,8 +32,20 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub theme: String,
     /// Leader-key bindings (see leader.rs).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub leader: crate::leader::Leader,
+    /// Editor for `e`, e.g. "nvim", "hx", "code -w"; empty = $VISUAL / $EDITOR / nvim.
+    #[serde(default)]
+    pub editor: String,
+    /// Launcher overrides: "review" (`v`), "grep" and "files" (leader `/`, `f`).
+    /// Run via `sh -c` in the worktree; `{base}` = the fork point, `{worktree}`
+    /// its path. Defaults use nvim (diffview.nvim, telescope.nvim).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub commands: std::collections::BTreeMap<String, String>,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Resolve the global config path: `$XDG_CONFIG_HOME/crew/workspaces.json`,
@@ -119,6 +131,8 @@ mod tests {
             theme: "nord".into(),
             active: 1,
             leader: Default::default(),
+            editor: String::new(),
+            commands: Default::default(),
             workspaces: vec![
                 WorkspaceEntry { path: "/a".into(), name: "a".into() },
                 WorkspaceEntry { path: "/b".into(), name: "b".into() },

@@ -12,6 +12,7 @@ mod agent;
 mod app;
 mod leader;
 mod pty;
+mod search;
 mod theme;
 mod store;
 mod ui;
@@ -401,7 +402,9 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
 
         // an editor/shell was requested: drop out of the TUI, run it, come back
         if let Some((cwd, argv)) = app.pending_shell.take() {
-            run_suspended(terminal, &cwd, &argv)?;
+            if let Err(msg) = run_suspended(terminal, &cwd, &argv)? {
+                app.status_msg = msg; // e.g. the editor isn't installed
+            }
         }
 
         if last_refresh.elapsed() >= refresh_every {
@@ -437,22 +440,25 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
 /// Suspend the TUI (leave raw mode + alternate screen), run `argv` in `cwd`
 /// attached to the real terminal, then restore the dashboard. Used for `e`
 /// (editor) and `!` (shell) — the child fully owns the terminal while it runs.
-fn run_suspended(terminal: &mut Term, cwd: &str, argv: &[String]) -> Result<()> {
+/// The inner Result reports a program that couldn't start (shown in the status line).
+fn run_suspended(terminal: &mut Term, cwd: &str, argv: &[String]) -> Result<std::result::Result<(), String>> {
     if argv.is_empty() {
-        return Ok(());
+        return Ok(Ok(()));
     }
     pop_kbd();
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
-    let _ = std::process::Command::new(&argv[0])
+    let ran = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(cwd)
-        .status();
+        .status()
+        .map(|_| ())
+        .map_err(|e| format!("couldn't run {}: {} (set \"editor\" in ~/.config/crew/workspaces.json)", argv[0], e));
     enable_raw_mode()?;
     execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     push_kbd();
     terminal.clear()?;
-    Ok(())
+    Ok(ran)
 }
 
 fn is_ctrl_tab(key: &KeyEvent) -> bool {
@@ -535,6 +541,9 @@ fn run_action(app: &mut App, action: leader::Action) {
         Zoom => app.zoom = !app.zoom,
         Help => { app.help_scroll = 0; app.mode = Mode::Help; }
         Settings => app.open_settings(),
+        Review => app.open_tool("review"),
+        Grep => app.open_search(search::Kind::Grep),
+        Files => app.open_search(search::Kind::Files),
         _ if !app.agent_selected() => app.status_msg = "select an agent first".into(),
         Diff => app.show_diff(),
         Push => app.open_push(),
@@ -682,7 +691,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     KeyCode::Char('q') | KeyCode::Char('w') | KeyCode::Char('n') | KeyCode::Char('a')
                     | KeyCode::Char('z') | KeyCode::Char('H') | KeyCode::Char('t') | KeyCode::Char(',')
                     | KeyCode::Char('/') | KeyCode::Char('?') | KeyCode::Char('1') | KeyCode::Char('2')
-                    | KeyCode::Char('3') | KeyCode::Char('4') | KeyCode::Char('S') | KeyCode::Char('A')
+                    | KeyCode::Char('3') | KeyCode::Char('4') | KeyCode::Char('S') | KeyCode::Char('A') | KeyCode::Char('v')
                     | KeyCode::Esc | KeyCode::Char('[') | KeyCode::Char(']') => {}
                     _ => return, // not an agent line: nothing to act on
                 }
@@ -740,6 +749,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('O') => app.open_branch_web(),
             KeyCode::Char('f') => app.fetch_selected(),
             KeyCode::Char('e') => app.open_editor(),
+            KeyCode::Char('v') => app.open_tool("review"),
             KeyCode::Char('!') => app.open_shell(),
             KeyCode::Char('d') => app.show_diff(),
             KeyCode::Char('L') => app.show_log(),
@@ -827,6 +837,22 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Char('p') if ctrl => app.picker.cursor = app.picker.cursor.saturating_sub(1),
                 KeyCode::Backspace => { app.picker.query.pop(); app.picker.cursor = 0; }
                 KeyCode::Char(c) if !ctrl => { app.picker.query.push(c); app.picker.cursor = 0; }
+                _ => {}
+            }
+        }
+        Mode::Search => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match code {
+                KeyCode::Esc => app.mode = app.search.ret,
+                KeyCode::Enter => app.search_open(),
+                KeyCode::Tab => app.search_toggle_kind(),
+                KeyCode::Down => app.search_move(1),
+                KeyCode::Up => app.search_move(-1),
+                KeyCode::Char('n') if ctrl => app.search_move(1),
+                KeyCode::Char('p') if ctrl => app.search_move(-1),
+                KeyCode::Char('y') if ctrl => app.search_yank(),
+                KeyCode::Backspace => { app.search.query.pop(); app.search.cursor = 0; app.search_update(); }
+                KeyCode::Char(c) if !ctrl => { app.search.query.push(c); app.search.cursor = 0; app.search_update(); }
                 _ => {}
             }
         }
